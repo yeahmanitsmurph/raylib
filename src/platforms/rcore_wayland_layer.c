@@ -59,6 +59,8 @@
 *
 **********************************************************************************************/
 
+#include "rshell.h"         // Layer-shell public API: LayerConfig and surface functions
+
 #include <EGL/egl.h>        // Native platform windowing system interface
 
 //----------------------------------------------------------------------------------
@@ -77,6 +79,19 @@ typedef struct {
 extern CoreData CORE;                   // Global CORE state context
 
 static PlatformData platform = { 0 };   // Platform specific data
+
+// Layer surface configuration for the primary surface (id 0), set before InitWindow()
+static LayerConfig layerConfig = {
+    .layer = LAYER_SHELL_TOP,
+    .anchor = LAYER_SHELL_ANCHOR_NONE,
+    .exclusiveZone = 0,
+    .keyboard = LAYER_SHELL_KEYBOARD_NONE,
+    .width = 0,
+    .height = 0,
+    .marginTop = 0, .marginRight = 0, .marginBottom = 0, .marginLeft = 0,
+    .output = "",
+    .nameSpace = "raylib"
+};
 
 //----------------------------------------------------------------------------------
 // Module Internal Functions Declaration
@@ -462,6 +477,185 @@ void PollInputEvents(void)
     }
 
     // TODO: Poll input events for current platform
+}
+
+//----------------------------------------------------------------------------------
+// Module Functions Definition: Layer-shell API (rshell.h)
+//----------------------------------------------------------------------------------
+// NOTE: Only the primary surface (id 0) is managed for now, multi-surface support
+// is declared in rshell.h and reported as not implemented yet
+
+// Get default layer config: floating, unanchored, top layer, no exclusive zone
+LayerConfig GetDefaultLayerConfig(void)
+{
+    LayerConfig config = { 0 };
+
+    config.layer = LAYER_SHELL_TOP;
+    config.anchor = LAYER_SHELL_ANCHOR_NONE;
+    config.exclusiveZone = 0;
+    config.keyboard = LAYER_SHELL_KEYBOARD_NONE;
+    config.width = 0;
+    config.height = 0;
+    config.marginTop = 0;
+    config.marginRight = 0;
+    config.marginBottom = 0;
+    config.marginLeft = 0;
+    config.output[0] = '\0';
+    strncpy(config.nameSpace, "raylib", LAYER_NAMESPACE_LENGTH - 1);
+
+    return config;
+}
+
+// Set config for primary surface (id 0), must be called before InitWindow()
+void SetLayerConfig(LayerConfig config)
+{
+    if (CORE.Window.ready)
+    {
+        TRACELOG(LOG_WARNING, "LAYER: SetLayerConfig() must be called before InitWindow(), config ignored");
+        return;
+    }
+
+    layerConfig = config;
+
+    // Make sure strings are always terminated, config may come from foreign bindings
+    layerConfig.output[LAYER_OUTPUT_NAME_LENGTH - 1] = '\0';
+    layerConfig.nameSpace[LAYER_NAMESPACE_LENGTH - 1] = '\0';
+    if (layerConfig.nameSpace[0] == '\0') strncpy(layerConfig.nameSpace, "raylib", LAYER_NAMESPACE_LENGTH - 1);
+}
+
+// Create an additional layer surface
+int CreateLayerSurface(LayerConfig config)
+{
+    TRACELOG(LOG_WARNING, "LAYER: CreateLayerSurface() not implemented yet, only primary surface (0) available");
+    return -1;
+}
+
+// Destroy a layer surface
+void DestroyLayerSurface(int surface)
+{
+    TRACELOG(LOG_WARNING, "LAYER: DestroyLayerSurface() not implemented yet, primary surface is destroyed by CloseWindow()");
+}
+
+// Get number of active layer surfaces
+int GetLayerSurfaceCount(void)
+{
+    return CORE.Window.ready? 1 : 0;
+}
+
+// Check if surface has been configured by the compositor
+bool IsLayerSurfaceReady(int surface)
+{
+    if (surface != 0) return false;
+    return CORE.Window.ready;
+}
+
+// Check if compositor requested the surface to close
+bool IsLayerSurfaceClosed(int surface)
+{
+    if (surface != 0) return true;
+    return CORE.Window.shouldClose;
+}
+
+// Make surface current for drawing
+void BeginSurface(int surface)
+{
+    if (surface != 0) TRACELOG(LOG_WARNING, "LAYER: BeginSurface() not implemented yet for surface %i, drawing to primary surface", surface);
+}
+
+// Get id of surface currently used for drawing
+int GetCurrentSurface(void)
+{
+    return 0;
+}
+
+// Map/unmap surface
+void SetLayerSurfaceVisible(int surface, bool visible)
+{
+    TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceVisible() not implemented yet");
+}
+
+// Check if surface is mapped
+bool IsLayerSurfaceVisible(int surface)
+{
+    if (surface != 0) return false;
+    return CORE.Window.ready;
+}
+
+// Request new size (logical px)
+void SetLayerSurfaceSize(int surface, int width, int height)
+{
+    TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceSize() not implemented yet");
+}
+
+// Set anchored edges
+void SetLayerSurfaceAnchor(int surface, int anchor)
+{
+    TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceAnchor() not implemented yet");
+}
+
+// Set exclusive zone (logical px)
+void SetLayerSurfaceExclusiveZone(int surface, int zone)
+{
+    TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceExclusiveZone() not implemented yet");
+}
+
+// Set margins from anchored edges (logical px)
+void SetLayerSurfaceMargins(int surface, int top, int right, int bottom, int left)
+{
+    TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceMargins() not implemented yet");
+}
+
+// Set stacking layer
+void SetLayerSurfaceLayer(int surface, int layer)
+{
+    TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceLayer() not implemented yet");
+}
+
+// Set keyboard interactivity
+void SetLayerSurfaceKeyboard(int surface, int keyboard)
+{
+    TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceKeyboard() not implemented yet");
+}
+
+// Get current surface width (logical px)
+int GetLayerSurfaceWidth(int surface)
+{
+    if (surface != 0) return 0;
+    return CORE.Window.screen.width;
+}
+
+// Get current surface height (logical px)
+int GetLayerSurfaceHeight(int surface)
+{
+    if (surface != 0) return 0;
+    return CORE.Window.screen.height;
+}
+
+// Get current surface buffer scale
+float GetLayerSurfaceScale(int surface)
+{
+    if (surface != 0) return 1.0f;
+    return GetWindowScaleDPI().x;
+}
+
+// Get monitor index the surface is displayed on
+int GetLayerSurfaceMonitor(int surface)
+{
+    if (surface != 0) return -1;
+    return GetCurrentMonitor();
+}
+
+// Get id of surface currently under the pointer
+int GetPointerSurface(void)
+{
+    return CORE.Input.Mouse.cursorOnScreen? 0 : -1;
+}
+
+// Get id of surface currently holding keyboard focus
+int GetKeyboardSurface(void)
+{
+    TRACELOG(LOG_WARNING, "LAYER: GetKeyboardSurface() not implemented yet");
+    return -1;
 }
 
 //----------------------------------------------------------------------------------
