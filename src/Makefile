@@ -32,6 +32,9 @@
 #         - Raspberry Pi 0-5 (DRM/KMS)
 #         - Linux DRM subsystem (KMS mode)
 #         - Embedded devices (with GPU)
+#     > PLATFORM_WAYLAND_LAYER (native Wayland wlr-layer-shell):
+#         - Linux Wayland compositors exposing zwlr_layer_shell_v1 (Hyprland, sway, river, ...)
+#         - Desktop-shell components: bars, panels, OSDs
 #     > PLATFORM_ANDROID (native NDK):
 #         - Android (ARM, ARM64)
 #     > PLATFORM_MEMORY
@@ -184,6 +187,15 @@ ifeq ($(TARGET_PLATFORM),PLATFORM_DRM)
         PLATFORM_SHELL = sh
     endif
 endif
+ifeq ($(TARGET_PLATFORM),PLATFORM_WAYLAND_LAYER)
+    UNAMEOS = $(shell uname)
+    ifeq ($(UNAMEOS),Linux)
+        PLATFORM_OS = LINUX
+    endif
+    ifndef PLATFORM_SHELL
+        PLATFORM_SHELL = sh
+    endif
+endif
 ifeq ($(TARGET_PLATFORM),$(filter $(TARGET_PLATFORM),PLATFORM_WEB PLATFORM_WEB_RGFW))
     ifeq ($(PLATFORM_OS),LINUX)
         ifndef PLATFORM_SHELL
@@ -277,6 +289,10 @@ endif
 ifeq ($(TARGET_PLATFORM),PLATFORM_DRM)
     GRAPHICS ?= GRAPHICS_API_OPENGL_ES2
     #GRAPHICS = GRAPHICS_API_OPENGL_SOFTWARE # Uncomment to use software rendering
+endif
+ifeq ($(TARGET_PLATFORM),PLATFORM_WAYLAND_LAYER)
+    # By default use OpenGL ES 2.0 through EGL on Wayland
+    GRAPHICS ?= GRAPHICS_API_OPENGL_ES2
 endif
 ifeq ($(TARGET_PLATFORM),PLATFORM_WEB)
     # On HTML5 OpenGL ES 2.0 is used, emscripten translates it to WebGL 1.0
@@ -477,6 +493,12 @@ ifeq ($(TARGET_PLATFORM),PLATFORM_DRM)
     CFLAGS += -DEGL_NO_X11
     CFLAGS += -Werror=implicit-function-declaration
 endif
+ifeq ($(TARGET_PLATFORM),PLATFORM_WAYLAND_LAYER)
+    # without EGL_NO_X11 eglplatform.h tears Xlib.h in which tears X.h in
+    # which contains a conflicting type Font
+    CFLAGS += -DEGL_NO_X11
+    CFLAGS += -Werror=implicit-function-declaration
+endif
 # Use Wayland display on Linux desktop
 ifeq ($(TARGET_PLATFORM),PLATFORM_DESKTOP_GLFW)
     ifeq ($(PLATFORM_OS), LINUX)
@@ -561,6 +583,10 @@ ifeq ($(TARGET_PLATFORM),PLATFORM_DRM)
         INCLUDE_PATHS += -I$(RPI_TOOLCHAIN_SYSROOT)/opt/vc/include
     endif
 endif
+ifeq ($(TARGET_PLATFORM),PLATFORM_WAYLAND_LAYER)
+    # Generated Wayland protocol headers (see wayland-scanner rules below)
+    INCLUDE_PATHS += -Iexternal/wayland-layer
+endif
 ifeq ($(TARGET_PLATFORM),PLATFORM_ANDROID)
     NATIVE_APP_GLUE = $(ANDROID_NDK)/sources/android/native_app_glue
     # Include android_native_app_glue.h
@@ -616,6 +642,9 @@ ifeq ($(TARGET_PLATFORM),PLATFORM_DRM)
     ifeq ($(USE_RPI_CROSSCOMPILER), TRUE)
         LDFLAGS += -L$(RPI_TOOLCHAIN_SYSROOT)/opt/vc/lib -L$(RPI_TOOLCHAIN_SYSROOT)/usr/lib
     endif
+endif
+ifeq ($(TARGET_PLATFORM),PLATFORM_WAYLAND_LAYER)
+    LDFLAGS += -Wl,-soname,lib$(RAYLIB_LIB_NAME).so.$(RAYLIB_API_VERSION)
 endif
 ifeq ($(TARGET_PLATFORM),PLATFORM_ANDROID)
     LDFLAGS += -Wl,-soname,libraylib.$(RAYLIB_API_VERSION).so -Wl,--exclude-libs,libatomic.a
@@ -714,6 +743,16 @@ ifeq ($(TARGET_PLATFORM),PLATFORM_DRM)
     LDLIBS = -ldrm -lgbm -lpthread -lrt -lm -ldl
     ifeq ($(GRAPHICS),GRAPHICS_API_OPENGL_ES2)
         LDLIBS += -lGLESv2 -lEGL
+    endif
+    ifeq ($(RAYLIB_MODULE_AUDIO),TRUE)
+        LDLIBS += -latomic
+    endif
+endif
+ifeq ($(TARGET_PLATFORM),PLATFORM_WAYLAND_LAYER)
+    # NOTE: Required packages (Debian/Ubuntu): libwayland-dev libegl-dev libgles-dev
+    LDLIBS = -lwayland-client -lwayland-egl -lEGL -lpthread -lrt -lm -ldl
+    ifeq ($(GRAPHICS),GRAPHICS_API_OPENGL_ES2)
+        LDLIBS += -lGLESv2
     endif
     ifeq ($(RAYLIB_MODULE_AUDIO),TRUE)
         LDLIBS += -latomic
@@ -824,6 +863,14 @@ else
 				cd $(RAYLIB_RELEASE_PATH) && ln -fsv lib$(RAYLIB_LIB_NAME).so.$(RAYLIB_VERSION) lib$(RAYLIB_LIB_NAME).so.$(RAYLIB_API_VERSION)
 				cd $(RAYLIB_RELEASE_PATH) && ln -fsv lib$(RAYLIB_LIB_NAME).so.$(RAYLIB_API_VERSION) lib$(RAYLIB_LIB_NAME).so
         endif
+        ifeq ($(TARGET_PLATFORM),PLATFORM_WAYLAND_LAYER)
+                # Compile raylib shared library version $(RAYLIB_VERSION).
+                # WARNING: you should type "make clean" before doing this target
+				$(CC) -shared -o $(RAYLIB_RELEASE_PATH)/lib$(RAYLIB_LIB_NAME).so.$(RAYLIB_VERSION) $(OBJS) $(LDFLAGS) $(LDLIBS)
+				@echo "raylib shared library generated (lib$(RAYLIB_LIB_NAME).so.$(RAYLIB_VERSION)) in $(RAYLIB_RELEASE_PATH)!"
+				cd $(RAYLIB_RELEASE_PATH) && ln -fsv lib$(RAYLIB_LIB_NAME).so.$(RAYLIB_VERSION) lib$(RAYLIB_LIB_NAME).so.$(RAYLIB_API_VERSION)
+				cd $(RAYLIB_RELEASE_PATH) && ln -fsv lib$(RAYLIB_LIB_NAME).so.$(RAYLIB_API_VERSION) lib$(RAYLIB_LIB_NAME).so
+        endif
         ifeq ($(TARGET_PLATFORM),PLATFORM_ANDROID)
 			$(CC) -shared -o $(RAYLIB_RELEASE_PATH)/lib$(RAYLIB_LIB_NAME).$(RAYLIB_VERSION).so $(OBJS) $(LDFLAGS) $(LDLIBS)
 			@echo "raylib shared library generated (lib$(RAYLIB_LIB_NAME).$(RAYLIB_VERSION).so)!"
@@ -900,6 +947,24 @@ ifeq ($(TARGET_PLATFORM),PLATFORM_DESKTOP_RGFW)
 		%-client-protocol-code.h: external/RGFW/deps/wayland/%.xml
 			wayland-scanner private-code $< $@
 	endif
+endif
+
+# Generate Wayland protocol headers for the layer-shell platform
+# NOTE: Generated *-client-protocol.h and *-client-protocol-code.h are #included
+# by platforms/rcore_wayland_layer.c, so no additional object files are required
+ifeq ($(TARGET_PLATFORM),PLATFORM_WAYLAND_LAYER)
+    WL_LAYER_PROTOCOLS_DIR = external/wayland-layer/protocols
+    WL_LAYER_GEN_DIR = external/wayland-layer
+    WL_LAYER_PROTOCOLS = xdg-shell wlr-layer-shell-unstable-v1 viewporter fractional-scale-v1
+    WL_LAYER_GEN_HEADERS = $(foreach proto,$(WL_LAYER_PROTOCOLS),$(WL_LAYER_GEN_DIR)/$(proto)-client-protocol.h $(WL_LAYER_GEN_DIR)/$(proto)-client-protocol-code.h)
+
+rcore.o : $(WL_LAYER_GEN_HEADERS)
+
+$(WL_LAYER_GEN_DIR)/%-client-protocol.h : $(WL_LAYER_PROTOCOLS_DIR)/%.xml
+	wayland-scanner client-header $< $@
+
+$(WL_LAYER_GEN_DIR)/%-client-protocol-code.h : $(WL_LAYER_PROTOCOLS_DIR)/%.xml
+	wayland-scanner private-code $< $@
 endif
 
 # Install generated and needed files to desired directories.
@@ -990,6 +1055,9 @@ clean_shell_sh:
 	rm -fv *.o $(RAYLIB_RELEASE_PATH)/lib$(RAYLIB_LIB_NAME).a $(RAYLIB_RELEASE_PATH)/lib$(RAYLIB_LIB_NAME).web.a $(RAYLIB_RELEASE_PATH)/lib$(RAYLIB_LIB_NAME).so* raygui.c $(RAYLIB_RELEASE_PATH)/*-protocol.h $(RAYLIB_RELEASE_PATH)/*-protocol-code.h $(RAYLIB_RELEASE_PATH)/*-protocol-code.c
 ifeq ($(TARGET_PLATFORM),PLATFORM_ANDROID)
 	rm -fv $(NATIVE_APP_GLUE)/android_native_app_glue.o
+endif
+ifeq ($(TARGET_PLATFORM),PLATFORM_WAYLAND_LAYER)
+	rm -fv $(WL_LAYER_GEN_HEADERS)
 endif
 
 # Set specific target variable

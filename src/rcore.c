@@ -529,6 +529,8 @@ const char *TextFormat(const char *text, ...); // Formatting of text with variab
     #include "platforms/rcore_web.c"
 #elif defined(PLATFORM_DRM)
     #include "platforms/rcore_drm.c"
+#elif defined(PLATFORM_WAYLAND_LAYER)
+    #include "platforms/rcore_wayland_layer.c"
 #elif defined(PLATFORM_ANDROID)
     #include "platforms/rcore_android.c"
 #elif defined(PLATFORM_MEMORY)
@@ -605,6 +607,8 @@ void InitWindow(int width, int height, const char *title)
     TRACELOG(LOG_INFO, "Platform backend: WEB (HTML5)");
 #elif defined(PLATFORM_DRM)
     TRACELOG(LOG_INFO, "Platform backend: NATIVE DRM");
+#elif defined(PLATFORM_WAYLAND_LAYER)
+    TRACELOG(LOG_INFO, "Platform backend: WAYLAND LAYER-SHELL");
 #elif defined(PLATFORM_ANDROID)
     TRACELOG(LOG_INFO, "Platform backend: ANDROID");
 #elif defined(PLATFORM_MEMORY)
