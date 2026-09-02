@@ -132,6 +132,18 @@ typedef struct {
     int outputCount;                        // Number of tracked outputs
     int currentOutput;                      // Output index the primary surface is displayed on (-1 = unknown)
 
+    // Primary layer surface (id 0)
+    struct wl_surface *wlSurface;           // Wayland surface
+    struct zwlr_layer_surface_v1 *layerSurface; // Layer-shell role object
+    struct wp_fractional_scale_v1 *fractionalScale; // Fractional scale object (optional)
+    struct wp_viewport *viewport;           // Viewport, maps the scaled buffer to the logical size (optional)
+    struct wl_egl_window *eglWindow;        // EGL native window bound to wlSurface (created with the graphics device)
+    bool configured;                        // First configure event received and acknowledged
+    int logicalWidth;                       // Surface size assigned by the compositor (logical px)
+    int logicalHeight;
+    double scale;                           // Current buffer scale (fractional when available)
+    int preferredBufferScale;               // Integer scale suggested by wl_surface.preferred_buffer_scale (0 = none)
+
     // EGL graphics device
     EGLDisplay device;      // Native display device (physical screen connection)
     EGLSurface surface;     // Surface to draw on, framebuffers (connected to context)
@@ -167,6 +179,24 @@ void ClosePlatform(void);        // Close platform
 
 static int InitWaylandConnection(void);     // Connect to the Wayland display and bind required globals
 static void CloseWaylandConnection(void);   // Release globals and disconnect from the Wayland display
+static int InitLayerSurface(void);          // Create the primary layer surface from layerConfig and wait for configure
+static void CloseLayerSurface(void);        // Destroy the primary layer surface objects
+static void UpdateSurfaceGeometry(void);    // Recompute buffer size from logical size and scale, update CORE.Window
+static int GetOutputIndex(struct wl_output *output);   // Get tracked output index from protocol object (-1 if unknown)
+static struct wl_output *FindOutputByName(const char *name); // Get output protocol object from connector name (NULL if not found)
+
+// Layer surface listener callbacks
+static void LayerSurfaceConfigureCallback(void *data, struct zwlr_layer_surface_v1 *layerSurface, uint32_t serial, uint32_t width, uint32_t height);
+static void LayerSurfaceClosedCallback(void *data, struct zwlr_layer_surface_v1 *layerSurface);
+
+// Wayland surface listener callbacks
+static void SurfaceEnterCallback(void *data, struct wl_surface *surface, struct wl_output *output);
+static void SurfaceLeaveCallback(void *data, struct wl_surface *surface, struct wl_output *output);
+static void SurfacePreferredBufferScaleCallback(void *data, struct wl_surface *surface, int32_t factor);
+static void SurfacePreferredBufferTransformCallback(void *data, struct wl_surface *surface, uint32_t transform);
+
+// Fractional scale listener callbacks
+static void FractionalScalePreferredScaleCallback(void *data, struct wp_fractional_scale_v1 *fractionalScale, uint32_t scale);
 
 // Wayland registry listener callbacks
 static void RegistryGlobalCallback(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version);
@@ -202,6 +232,22 @@ static const struct wl_output_listener outputListener = {
 
 static const struct xdg_wm_base_listener wmBaseListener = {
     .ping = WmBasePingCallback
+};
+
+static const struct zwlr_layer_surface_v1_listener layerSurfaceListener = {
+    .configure = LayerSurfaceConfigureCallback,
+    .closed = LayerSurfaceClosedCallback
+};
+
+static const struct wl_surface_listener surfaceListener = {
+    .enter = SurfaceEnterCallback,
+    .leave = SurfaceLeaveCallback,
+    .preferred_buffer_scale = SurfacePreferredBufferScaleCallback,
+    .preferred_buffer_transform = SurfacePreferredBufferTransformCallback
+};
+
+static const struct wp_fractional_scale_v1_listener fractionalScaleListener = {
+    .preferred_scale = FractionalScalePreferredScaleCallback
 };
 
 //----------------------------------------------------------------------------------
@@ -444,10 +490,11 @@ Vector2 GetWindowPosition(void)
 }
 
 // Get window scale DPI factor for current monitor
+// NOTE: Buffer scale of the primary surface (fractional when the compositor supports it)
 Vector2 GetWindowScaleDPI(void)
 {
-    TRACELOG(LOG_WARNING, "GetWindowScaleDPI() not implemented on target platform");
-    return (Vector2){ 1.0f, 1.0f };
+    float scale = (platform.scale > 0.0)? (float)platform.scale : 1.0f;
+    return (Vector2){ scale, scale };
 }
 
 // Set clipboard text content
@@ -693,7 +740,7 @@ int GetLayerSurfaceCount(void)
 bool IsLayerSurfaceReady(int surface)
 {
     if (surface != 0) return false;
-    return CORE.Window.ready;
+    return platform.configured;
 }
 
 // Check if compositor requested the surface to close
@@ -729,39 +776,107 @@ bool IsLayerSurfaceVisible(int surface)
 }
 
 // Request new size (logical px)
+// NOTE: Requests are double-buffered by the compositor, they take effect on the next
+// wl_surface commit (next frame) and the compositor answers with a configure event
 void SetLayerSurfaceSize(int surface, int width, int height)
 {
-    TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceSize() not implemented yet");
+    if ((surface != 0) || (platform.layerSurface == NULL))
+    {
+        TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceSize() only available for primary surface (0)");
+        return;
+    }
+
+    layerConfig.width = width;
+    layerConfig.height = height;
+    zwlr_layer_surface_v1_set_size(platform.layerSurface, (uint32_t)((width > 0)? width : 0), (uint32_t)((height > 0)? height : 0));
+    wl_surface_commit(platform.wlSurface);
 }
 
 // Set anchored edges
 void SetLayerSurfaceAnchor(int surface, int anchor)
 {
-    TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceAnchor() not implemented yet");
+    if ((surface != 0) || (platform.layerSurface == NULL))
+    {
+        TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceAnchor() only available for primary surface (0)");
+        return;
+    }
+
+    layerConfig.anchor = anchor;
+    zwlr_layer_surface_v1_set_anchor(platform.layerSurface, (uint32_t)anchor);
+    wl_surface_commit(platform.wlSurface);
 }
 
 // Set exclusive zone (logical px)
 void SetLayerSurfaceExclusiveZone(int surface, int zone)
 {
-    TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceExclusiveZone() not implemented yet");
+    if ((surface != 0) || (platform.layerSurface == NULL))
+    {
+        TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceExclusiveZone() only available for primary surface (0)");
+        return;
+    }
+
+    layerConfig.exclusiveZone = zone;
+    zwlr_layer_surface_v1_set_exclusive_zone(platform.layerSurface, zone);
+    wl_surface_commit(platform.wlSurface);
 }
 
 // Set margins from anchored edges (logical px)
 void SetLayerSurfaceMargins(int surface, int top, int right, int bottom, int left)
 {
-    TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceMargins() not implemented yet");
+    if ((surface != 0) || (platform.layerSurface == NULL))
+    {
+        TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceMargins() only available for primary surface (0)");
+        return;
+    }
+
+    layerConfig.marginTop = top;
+    layerConfig.marginRight = right;
+    layerConfig.marginBottom = bottom;
+    layerConfig.marginLeft = left;
+    zwlr_layer_surface_v1_set_margin(platform.layerSurface, top, right, bottom, left);
+    wl_surface_commit(platform.wlSurface);
 }
 
 // Set stacking layer
+// NOTE: Requires zwlr_layer_shell_v1 v2
 void SetLayerSurfaceLayer(int surface, int layer)
 {
-    TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceLayer() not implemented yet");
+    if ((surface != 0) || (platform.layerSurface == NULL))
+    {
+        TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceLayer() only available for primary surface (0)");
+        return;
+    }
+
+    if (zwlr_layer_surface_v1_get_version(platform.layerSurface) < ZWLR_LAYER_SURFACE_V1_SET_LAYER_SINCE_VERSION)
+    {
+        TRACELOG(LOG_WARNING, "LAYER: Compositor layer-shell version does not support changing the layer after creation");
+        return;
+    }
+
+    layerConfig.layer = layer;
+    zwlr_layer_surface_v1_set_layer(platform.layerSurface, (uint32_t)layer);
+    wl_surface_commit(platform.wlSurface);
 }
 
 // Set keyboard interactivity
+// NOTE: LAYER_SHELL_KEYBOARD_ON_DEMAND requires zwlr_layer_shell_v1 v4, downgraded to EXCLUSIVE otherwise
 void SetLayerSurfaceKeyboard(int surface, int keyboard)
 {
-    TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceKeyboard() not implemented yet");
+    if ((surface != 0) || (platform.layerSurface == NULL))
+    {
+        TRACELOG(LOG_WARNING, "LAYER: SetLayerSurfaceKeyboard() only available for primary surface (0)");
+        return;
+    }
+
+    if ((keyboard == LAYER_SHELL_KEYBOARD_ON_DEMAND) && (zwlr_layer_surface_v1_get_version(platform.layerSurface) < 4))
+    {
+        TRACELOG(LOG_WARNING, "LAYER: Compositor layer-shell version does not support on-demand keyboard, using exclusive");
+        keyboard = LAYER_SHELL_KEYBOARD_EXCLUSIVE;
+    }
+
+    layerConfig.keyboard = keyboard;
+    zwlr_layer_surface_v1_set_keyboard_interactivity(platform.layerSurface, (uint32_t)keyboard);
+    wl_surface_commit(platform.wlSurface);
 }
 
 // Get current surface width (logical px)
@@ -782,7 +897,7 @@ int GetLayerSurfaceHeight(int surface)
 float GetLayerSurfaceScale(int surface)
 {
     if (surface != 0) return 1.0f;
-    return GetWindowScaleDPI().x;
+    return (float)platform.scale;
 }
 
 // Get monitor index the surface is displayed on
@@ -813,9 +928,14 @@ int GetKeyboardSurface(void)
 int InitPlatform(void)
 {
     platform.currentOutput = -1;
+    platform.scale = 1.0;
     platform.device = EGL_NO_DISPLAY;
     platform.surface = EGL_NO_SURFACE;
     platform.context = EGL_NO_CONTEXT;
+
+    // Layer surfaces always work in logical pixels with a scaled buffer,
+    // following raylib high-DPI conventions (screen = logical, render = physical)
+    FLAG_SET(CORE.Window.flags, FLAG_WINDOW_HIGHDPI);
 
     // Connect to the Wayland display and bind required globals
     //----------------------------------------------------------------------------
@@ -827,9 +947,15 @@ int InitPlatform(void)
     }
     //----------------------------------------------------------------------------
 
-    // TODO: Create the layer surface from LayerConfig
+    // Create the layer surface from LayerConfig and wait for the compositor configure
     //----------------------------------------------------------------------------
-    // ...
+    if (InitLayerSurface() != 0)
+    {
+        TRACELOG(LOG_FATAL, "PLATFORM: Failed to create layer surface");
+        CloseLayerSurface();
+        CloseWaylandConnection();
+        return -1;
+    }
     //----------------------------------------------------------------------------
 
     // TODO: Initialize graphics device (EGL context on the layer surface)
@@ -862,9 +988,283 @@ void ClosePlatform(void)
 {
     // TODO: Destroy EGL context and surface
 
-    // TODO: Destroy layer surface and input objects
+    // TODO: Destroy input objects
 
+    CloseLayerSurface();
     CloseWaylandConnection();
+}
+
+// Create the primary layer surface from layerConfig and wait for the first configure event
+// NOTE: Sizes: 0 on an axis means "stretch between anchors" and requires the surface to be
+// anchored to both opposite edges of that axis, otherwise it is a protocol error. In that case
+// the InitWindow() size is used as the request and, if it is 0 too, the axis is auto-stretched
+static int InitLayerSurface(void)
+{
+    platform.wlSurface = wl_compositor_create_surface(platform.compositor);
+    if (platform.wlSurface == NULL)
+    {
+        TRACELOG(LOG_WARNING, "LAYER: Failed to create wl_surface");
+        return -1;
+    }
+
+    wl_surface_add_listener(platform.wlSurface, &surfaceListener, NULL);
+
+    // Fractional scale requires viewporter to map the scaled buffer to the logical surface size
+    if ((platform.fractionalScaleManager != NULL) && (platform.viewporter != NULL))
+    {
+        platform.viewport = wp_viewporter_get_viewport(platform.viewporter, platform.wlSurface);
+        platform.fractionalScale = wp_fractional_scale_manager_v1_get_fractional_scale(platform.fractionalScaleManager, platform.wlSurface);
+        wp_fractional_scale_v1_add_listener(platform.fractionalScale, &fractionalScaleListener, NULL);
+    }
+
+    // Resolve requested output, NULL lets the compositor choose (usually the focused one)
+    struct wl_output *output = NULL;
+    if (layerConfig.output[0] != '\0')
+    {
+        output = FindOutputByName(layerConfig.output);
+        if (output == NULL) TRACELOG(LOG_WARNING, "LAYER: Output \"%s\" not found, letting the compositor choose", layerConfig.output);
+    }
+
+    if ((layerConfig.layer < LAYER_SHELL_BACKGROUND) || (layerConfig.layer > LAYER_SHELL_OVERLAY))
+    {
+        TRACELOG(LOG_WARNING, "LAYER: Invalid layer %i, using LAYER_SHELL_TOP", layerConfig.layer);
+        layerConfig.layer = LAYER_SHELL_TOP;
+    }
+
+    platform.layerSurface = zwlr_layer_shell_v1_get_layer_surface(platform.layerShell, platform.wlSurface, output, (uint32_t)layerConfig.layer, layerConfig.nameSpace);
+    if (platform.layerSurface == NULL)
+    {
+        TRACELOG(LOG_WARNING, "LAYER: Failed to create zwlr_layer_surface_v1");
+        return -1;
+    }
+
+    zwlr_layer_surface_v1_add_listener(platform.layerSurface, &layerSurfaceListener, NULL);
+
+    // Compute requested size: config size wins, InitWindow() size is the fallback hint
+    int anchor = layerConfig.anchor & (LAYER_SHELL_ANCHOR_TOP | LAYER_SHELL_ANCHOR_BOTTOM | LAYER_SHELL_ANCHOR_LEFT | LAYER_SHELL_ANCHOR_RIGHT);
+    bool stretchX = ((anchor & LAYER_SHELL_ANCHOR_LEFT) && (anchor & LAYER_SHELL_ANCHOR_RIGHT));
+    bool stretchY = ((anchor & LAYER_SHELL_ANCHOR_TOP) && (anchor & LAYER_SHELL_ANCHOR_BOTTOM));
+
+    int width = (layerConfig.width > 0)? layerConfig.width : 0;
+    int height = (layerConfig.height > 0)? layerConfig.height : 0;
+
+    if ((width == 0) && !stretchX) width = CORE.Window.screen.width;
+    if ((height == 0) && !stretchY) height = CORE.Window.screen.height;
+
+    if ((width == 0) && !stretchX)
+    {
+        TRACELOG(LOG_WARNING, "LAYER: No width provided and surface not anchored left+right, stretching horizontally");
+        anchor |= (LAYER_SHELL_ANCHOR_LEFT | LAYER_SHELL_ANCHOR_RIGHT);
+    }
+
+    if ((height == 0) && !stretchY)
+    {
+        TRACELOG(LOG_WARNING, "LAYER: No height provided and surface not anchored top+bottom, stretching vertically");
+        anchor |= (LAYER_SHELL_ANCHOR_TOP | LAYER_SHELL_ANCHOR_BOTTOM);
+    }
+
+    layerConfig.anchor = anchor;
+    layerConfig.width = width;
+    layerConfig.height = height;
+
+    int keyboard = layerConfig.keyboard;
+    if ((keyboard == LAYER_SHELL_KEYBOARD_ON_DEMAND) && (zwlr_layer_surface_v1_get_version(platform.layerSurface) < 4))
+    {
+        TRACELOG(LOG_WARNING, "LAYER: Compositor layer-shell version does not support on-demand keyboard, using exclusive");
+        keyboard = LAYER_SHELL_KEYBOARD_EXCLUSIVE;
+        layerConfig.keyboard = keyboard;
+    }
+
+    zwlr_layer_surface_v1_set_anchor(platform.layerSurface, (uint32_t)anchor);
+    zwlr_layer_surface_v1_set_size(platform.layerSurface, (uint32_t)width, (uint32_t)height);
+    zwlr_layer_surface_v1_set_exclusive_zone(platform.layerSurface, layerConfig.exclusiveZone);
+    zwlr_layer_surface_v1_set_margin(platform.layerSurface, layerConfig.marginTop, layerConfig.marginRight, layerConfig.marginBottom, layerConfig.marginLeft);
+    zwlr_layer_surface_v1_set_keyboard_interactivity(platform.layerSurface, (uint32_t)keyboard);
+
+    // Until the compositor answers, assume the requested size
+    platform.logicalWidth = width;
+    platform.logicalHeight = height;
+
+    // Initial commit without a buffer: the compositor answers with a configure event
+    wl_surface_commit(platform.wlSurface);
+
+    while (!platform.configured)
+    {
+        if (wl_display_roundtrip(platform.display) < 0)
+        {
+            TRACELOG(LOG_WARNING, "LAYER: Display error while waiting for layer surface configure");
+            return -1;
+        }
+
+        if (CORE.Window.shouldClose)
+        {
+            TRACELOG(LOG_WARNING, "LAYER: Compositor closed the layer surface before configuring it");
+            return -1;
+        }
+    }
+
+    TRACELOG(LOG_INFO, "LAYER: Surface \"%s\" created on layer %i, anchor 0x%x, exclusive zone %i", layerConfig.nameSpace, layerConfig.layer, anchor, layerConfig.exclusiveZone);
+    TRACELOG(LOG_INFO, "LAYER: Configured size: %i x %i (logical), scale %.2f", platform.logicalWidth, platform.logicalHeight, platform.scale);
+
+    return 0;
+}
+
+// Destroy the primary layer surface objects
+static void CloseLayerSurface(void)
+{
+    if (platform.fractionalScale != NULL) wp_fractional_scale_v1_destroy(platform.fractionalScale);
+    if (platform.viewport != NULL) wp_viewport_destroy(platform.viewport);
+    if (platform.layerSurface != NULL) zwlr_layer_surface_v1_destroy(platform.layerSurface);
+    if (platform.wlSurface != NULL) wl_surface_destroy(platform.wlSurface);
+
+    platform.fractionalScale = NULL;
+    platform.viewport = NULL;
+    platform.layerSurface = NULL;
+    platform.wlSurface = NULL;
+    platform.configured = false;
+}
+
+// Recompute buffer size from logical size and scale, update CORE.Window
+// NOTE: Follows raylib high-DPI conventions:
+//  -> CORE.Window.screen: logical size (what the user draws in)
+//  -> CORE.Window.render: physical buffer size (logical*scale)
+//  -> CORE.Window.screenScale: MatrixScale(scale, scale, 1) applied to the default framebuffer drawing
+static void UpdateSurfaceGeometry(void)
+{
+    if ((platform.logicalWidth <= 0) || (platform.logicalHeight <= 0)) return;
+
+    // Choose scale source: fractional scale (needs viewporter) > wl_surface.preferred_buffer_scale > output integer scale
+    if (platform.viewport == NULL)
+    {
+        int intScale = 1;
+        if (platform.preferredBufferScale > 0) intScale = platform.preferredBufferScale;
+        else if ((platform.currentOutput >= 0) && (platform.currentOutput < platform.outputCount)) intScale = platform.outputs[platform.currentOutput].scale;
+        platform.scale = (double)intScale;
+    }
+    else if (platform.scale <= 0.0) platform.scale = 1.0;
+
+    int physicalWidth = (int)(platform.logicalWidth*platform.scale + 0.5);
+    int physicalHeight = (int)(platform.logicalHeight*platform.scale + 0.5);
+
+    if (platform.eglWindow != NULL) wl_egl_window_resize(platform.eglWindow, physicalWidth, physicalHeight, 0, 0);
+
+    if (platform.viewport != NULL)
+    {
+        // Viewport maps the whole (scaled) buffer to the logical surface size
+        wp_viewport_set_destination(platform.viewport, platform.logicalWidth, platform.logicalHeight);
+    }
+    else if (wl_surface_get_version(platform.wlSurface) >= WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION)
+    {
+        wl_surface_set_buffer_scale(platform.wlSurface, (int32_t)platform.scale);
+    }
+
+    bool sizeChanged = ((CORE.Window.render.width != physicalWidth) || (CORE.Window.render.height != physicalHeight) ||
+                        (CORE.Window.screen.width != platform.logicalWidth) || (CORE.Window.screen.height != platform.logicalHeight));
+
+    CORE.Window.screen.width = platform.logicalWidth;
+    CORE.Window.screen.height = platform.logicalHeight;
+    CORE.Window.render.width = physicalWidth;
+    CORE.Window.render.height = physicalHeight;
+    CORE.Window.currentFbo = CORE.Window.render;
+    CORE.Window.screenScale = MatrixScale((float)platform.scale, (float)platform.scale, 1.0f);
+
+    // Viewport can only be reset once the GL context exists (after InitWindow() completes)
+    if (CORE.Window.ready)
+    {
+        SetupViewport(physicalWidth, physicalHeight);
+        if (sizeChanged) CORE.Window.resizedLastFrame = true;
+    }
+}
+
+// Get tracked output index from protocol object
+static int GetOutputIndex(struct wl_output *output)
+{
+    for (int i = 0; i < platform.outputCount; i++)
+    {
+        if (platform.outputs[i].output == output) return i;
+    }
+
+    return -1;
+}
+
+// Get output protocol object from connector name
+static struct wl_output *FindOutputByName(const char *name)
+{
+    for (int i = 0; i < platform.outputCount; i++)
+    {
+        if (strcmp(platform.outputs[i].name, name) == 0) return platform.outputs[i].output;
+    }
+
+    return NULL;
+}
+
+// Layer surface: compositor assigned a size, must be acknowledged
+// NOTE: A 0 dimension means the client is free to choose, the requested size is kept
+static void LayerSurfaceConfigureCallback(void *data, struct zwlr_layer_surface_v1 *layerSurface, uint32_t serial, uint32_t width, uint32_t height)
+{
+    if (width > 0) platform.logicalWidth = (int)width;
+    else if (platform.logicalWidth <= 0) platform.logicalWidth = (layerConfig.width > 0)? layerConfig.width : 1;
+
+    if (height > 0) platform.logicalHeight = (int)height;
+    else if (platform.logicalHeight <= 0) platform.logicalHeight = (layerConfig.height > 0)? layerConfig.height : 1;
+
+    zwlr_layer_surface_v1_ack_configure(layerSurface, serial);
+
+    platform.configured = true;
+
+    UpdateSurfaceGeometry();
+}
+
+// Layer surface: compositor closed the surface (output removed, shell restarted...)
+static void LayerSurfaceClosedCallback(void *data, struct zwlr_layer_surface_v1 *layerSurface)
+{
+    TRACELOG(LOG_INFO, "LAYER: Surface closed by the compositor");
+    CORE.Window.shouldClose = true;
+}
+
+// Surface: now displayed on an output
+static void SurfaceEnterCallback(void *data, struct wl_surface *surface, struct wl_output *output)
+{
+    int index = GetOutputIndex(output);
+    if (index < 0) return;
+
+    platform.currentOutput = index;
+
+    // Scale may differ between outputs when fractional scale is unavailable
+    if (platform.viewport == NULL) UpdateSurfaceGeometry();
+}
+
+// Surface: no longer displayed on an output
+static void SurfaceLeaveCallback(void *data, struct wl_surface *surface, struct wl_output *output)
+{
+    int index = GetOutputIndex(output);
+    if ((index >= 0) && (platform.currentOutput == index)) platform.currentOutput = -1;
+}
+
+// Surface: compositor suggested integer buffer scale (wl_surface v6)
+static void SurfacePreferredBufferScaleCallback(void *data, struct wl_surface *surface, int32_t factor)
+{
+    platform.preferredBufferScale = (factor > 0)? factor : 1;
+
+    if (platform.viewport == NULL) UpdateSurfaceGeometry();
+}
+
+// Surface: compositor suggested buffer transform (wl_surface v6), not used
+static void SurfacePreferredBufferTransformCallback(void *data, struct wl_surface *surface, uint32_t transform)
+{
+    // Rotated outputs are handled by the compositor, buffer is always kept unrotated
+}
+
+// Fractional scale: compositor preferred scale in 1/120 units
+static void FractionalScalePreferredScaleCallback(void *data, struct wp_fractional_scale_v1 *fractionalScale, uint32_t scale)
+{
+    double newScale = (scale > 0)? ((double)scale/120.0) : 1.0;
+
+    if (newScale != platform.scale)
+    {
+        platform.scale = newScale;
+        UpdateSurfaceGeometry();
+    }
 }
 
 // Connect to the Wayland display and bind required globals
