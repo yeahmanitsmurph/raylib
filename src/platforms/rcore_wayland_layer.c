@@ -61,12 +61,78 @@
 
 #include "rshell.h"         // Layer-shell public API: LayerConfig and surface functions
 
+#include <string.h>         // Required for: strncpy(), strcmp(), memset()
+#include <unistd.h>         // Required for: close()
+#include <poll.h>           // Required for: poll() on the Wayland display fd
+
+#include <wayland-client.h> // Wayland client library: display, registry, core protocol objects
+#include <wayland-egl.h>    // Wayland EGL bridge: wl_egl_window
+
 #include <EGL/egl.h>        // Native platform windowing system interface
+#include <EGL/eglext.h>     // EGL extensions
+
+// Generated protocol headers and marshalling code (see src/Makefile wayland-scanner rules)
+// NOTE: The *-code.h files are included directly so no extra object files are required
+#include "xdg-shell-client-protocol.h"
+#include "xdg-shell-client-protocol-code.h"
+#include "wlr-layer-shell-unstable-v1-client-protocol.h"
+#include "wlr-layer-shell-unstable-v1-client-protocol-code.h"
+#include "viewporter-client-protocol.h"
+#include "viewporter-client-protocol-code.h"
+#include "fractional-scale-v1-client-protocol.h"
+#include "fractional-scale-v1-client-protocol-code.h"
+
+#ifndef EGL_PLATFORM_WAYLAND_KHR
+    #define EGL_PLATFORM_WAYLAND_KHR  0x31D8
+#endif
+
+//----------------------------------------------------------------------------------
+// Defines and Macros
+//----------------------------------------------------------------------------------
+#define MAX_WAYLAND_OUTPUTS         8       // Maximum number of tracked outputs (monitors)
+
+#define WL_COMPOSITOR_BIND_VERSION  4       // wl_compositor v4: wl_surface.set_buffer_scale/damage_buffer (v6 used when available)
+#define WL_SEAT_BIND_VERSION        5       // wl_seat v5: wl_pointer.frame and axis_source events
+#define WL_OUTPUT_BIND_VERSION      4       // wl_output v4: name/description events (v2 minimum for scale/done)
+#define WL_LAYER_SHELL_BIND_VERSION 4       // zwlr_layer_shell_v1 v4: keyboard_interactivity on_demand, set_layer
 
 //----------------------------------------------------------------------------------
 // Types and Structures Definition
 //----------------------------------------------------------------------------------
+
+// Wayland output (monitor) data, filled by wl_output events
 typedef struct {
+    struct wl_output *output;       // Output protocol object
+    uint32_t globalName;            // Registry global name (used on global_remove)
+    char name[LAYER_OUTPUT_NAME_LENGTH]; // Connector name (e.g. "DP-1"), requires wl_output v4
+    char description[128];          // Human readable description (make/model), requires wl_output v4
+    int x;                          // Position in the global compositor space (logical px)
+    int y;
+    int width;                      // Current mode size (physical px)
+    int height;
+    int physicalWidth;              // Physical size in millimetres
+    int physicalHeight;
+    int refreshRate;                // Current mode refresh rate (mHz)
+    int scale;                      // Integer scale factor (fallback when fractional scale is unavailable)
+    bool done;                      // All properties received at least once (wl_output.done)
+} WaylandOutput;
+
+typedef struct {
+    // Wayland connection and globals
+    struct wl_display *display;             // Display connection
+    struct wl_registry *registry;           // Global objects registry
+    struct wl_compositor *compositor;       // Surface factory
+    struct zwlr_layer_shell_v1 *layerShell; // Layer-shell global (required)
+    struct wl_seat *seat;                   // Input seat
+    struct xdg_wm_base *wmBase;             // xdg-shell base (required by layer-shell popups, optional here)
+    struct wp_fractional_scale_manager_v1 *fractionalScaleManager; // Fractional scale (optional)
+    struct wp_viewporter *viewporter;       // Viewporter (optional, required for fractional scale)
+
+    WaylandOutput outputs[MAX_WAYLAND_OUTPUTS]; // Tracked outputs (monitors)
+    int outputCount;                        // Number of tracked outputs
+    int currentOutput;                      // Output index the primary surface is displayed on (-1 = unknown)
+
+    // EGL graphics device
     EGLDisplay device;      // Native display device (physical screen connection)
     EGLSurface surface;     // Surface to draw on, framebuffers (connected to context)
     EGLContext context;     // Graphic context, mode in which drawing can be done
@@ -97,7 +163,46 @@ static LayerConfig layerConfig = {
 // Module Internal Functions Declaration
 //----------------------------------------------------------------------------------
 int InitPlatform(void);          // Initialize platform (graphics, inputs and more)
-bool InitGraphicsDevice(void);   // Initialize graphics device
+void ClosePlatform(void);        // Close platform
+
+static int InitWaylandConnection(void);     // Connect to the Wayland display and bind required globals
+static void CloseWaylandConnection(void);   // Release globals and disconnect from the Wayland display
+
+// Wayland registry listener callbacks
+static void RegistryGlobalCallback(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version);
+static void RegistryGlobalRemoveCallback(void *data, struct wl_registry *registry, uint32_t name);
+
+// Wayland output listener callbacks
+static void OutputGeometryCallback(void *data, struct wl_output *output, int32_t x, int32_t y, int32_t physicalWidth, int32_t physicalHeight, int32_t subpixel, const char *make, const char *model, int32_t transform);
+static void OutputModeCallback(void *data, struct wl_output *output, uint32_t flags, int32_t width, int32_t height, int32_t refresh);
+static void OutputDoneCallback(void *data, struct wl_output *output);
+static void OutputScaleCallback(void *data, struct wl_output *output, int32_t factor);
+static void OutputNameCallback(void *data, struct wl_output *output, const char *name);
+static void OutputDescriptionCallback(void *data, struct wl_output *output, const char *description);
+
+// xdg_wm_base listener callbacks
+static void WmBasePingCallback(void *data, struct xdg_wm_base *wmBase, uint32_t serial);
+
+//----------------------------------------------------------------------------------
+// Wayland Listeners
+//----------------------------------------------------------------------------------
+static const struct wl_registry_listener registryListener = {
+    .global = RegistryGlobalCallback,
+    .global_remove = RegistryGlobalRemoveCallback
+};
+
+static const struct wl_output_listener outputListener = {
+    .geometry = OutputGeometryCallback,
+    .mode = OutputModeCallback,
+    .done = OutputDoneCallback,
+    .scale = OutputScaleCallback,
+    .name = OutputNameCallback,
+    .description = OutputDescriptionCallback
+};
+
+static const struct xdg_wm_base_listener wmBaseListener = {
+    .ping = WmBasePingCallback
+};
 
 //----------------------------------------------------------------------------------
 // Module Functions Declaration
@@ -229,64 +334,106 @@ void *GetWindowHandle(void)
 // Get number of monitors
 int GetMonitorCount(void)
 {
-    TRACELOG(LOG_WARNING, "GetMonitorCount() not implemented on target platform");
-    return 1;
+    return platform.outputCount;
 }
 
 // Get current monitor where window is placed
+// NOTE: Tracked from wl_surface.enter, falls back to the first output
 int GetCurrentMonitor(void)
 {
-    TRACELOG(LOG_WARNING, "GetCurrentMonitor() not implemented on target platform");
+    if ((platform.currentOutput >= 0) && (platform.currentOutput < platform.outputCount)) return platform.currentOutput;
     return 0;
 }
 
 // Get selected monitor position
+// NOTE: Position in the global compositor space (logical px)
 Vector2 GetMonitorPosition(int monitor)
 {
-    TRACELOG(LOG_WARNING, "GetMonitorPosition() not implemented on target platform");
-    return (Vector2){ 0, 0 };
+    if ((monitor < 0) || (monitor >= platform.outputCount))
+    {
+        TRACELOG(LOG_WARNING, "LAYER: Failed to find selected monitor");
+        return (Vector2){ 0, 0 };
+    }
+
+    return (Vector2){ (float)platform.outputs[monitor].x, (float)platform.outputs[monitor].y };
 }
 
 // Get selected monitor width (currently used by monitor)
+// NOTE: Current mode width (physical px)
 int GetMonitorWidth(int monitor)
 {
-    TRACELOG(LOG_WARNING, "GetMonitorWidth() not implemented on target platform");
-    return 0;
+    if ((monitor < 0) || (monitor >= platform.outputCount))
+    {
+        TRACELOG(LOG_WARNING, "LAYER: Failed to find selected monitor");
+        return 0;
+    }
+
+    return platform.outputs[monitor].width;
 }
 
 // Get selected monitor height (currently used by monitor)
+// NOTE: Current mode height (physical px)
 int GetMonitorHeight(int monitor)
 {
-    TRACELOG(LOG_WARNING, "GetMonitorHeight() not implemented on target platform");
-    return 0;
+    if ((monitor < 0) || (monitor >= platform.outputCount))
+    {
+        TRACELOG(LOG_WARNING, "LAYER: Failed to find selected monitor");
+        return 0;
+    }
+
+    return platform.outputs[monitor].height;
 }
 
 // Get selected monitor physical width in millimetres
 int GetMonitorPhysicalWidth(int monitor)
 {
-    TRACELOG(LOG_WARNING, "GetMonitorPhysicalWidth() not implemented on target platform");
-    return 0;
+    if ((monitor < 0) || (monitor >= platform.outputCount))
+    {
+        TRACELOG(LOG_WARNING, "LAYER: Failed to find selected monitor");
+        return 0;
+    }
+
+    return platform.outputs[monitor].physicalWidth;
 }
 
 // Get selected monitor physical height in millimetres
 int GetMonitorPhysicalHeight(int monitor)
 {
-    TRACELOG(LOG_WARNING, "GetMonitorPhysicalHeight() not implemented on target platform");
-    return 0;
+    if ((monitor < 0) || (monitor >= platform.outputCount))
+    {
+        TRACELOG(LOG_WARNING, "LAYER: Failed to find selected monitor");
+        return 0;
+    }
+
+    return platform.outputs[monitor].physicalHeight;
 }
 
 // Get selected monitor refresh rate
+// NOTE: wl_output reports mHz, rounded to Hz
 int GetMonitorRefreshRate(int monitor)
 {
-    TRACELOG(LOG_WARNING, "GetMonitorRefreshRate() not implemented on target platform");
-    return 0;
+    if ((monitor < 0) || (monitor >= platform.outputCount))
+    {
+        TRACELOG(LOG_WARNING, "LAYER: Failed to find selected monitor");
+        return 0;
+    }
+
+    return (platform.outputs[monitor].refreshRate + 500)/1000;
 }
 
 // Get the human-readable, UTF-8 encoded name of the selected monitor
+// NOTE: Returns the connector name (e.g. "DP-1") when available (wl_output v4),
+// otherwise the make/model description
 const char *GetMonitorName(int monitor)
 {
-    TRACELOG(LOG_WARNING, "GetMonitorName() not implemented on target platform");
-    return "";
+    if ((monitor < 0) || (monitor >= platform.outputCount))
+    {
+        TRACELOG(LOG_WARNING, "LAYER: Failed to find selected monitor");
+        return "";
+    }
+
+    if (platform.outputs[monitor].name[0] != '\0') return platform.outputs[monitor].name;
+    return platform.outputs[monitor].description;
 }
 
 // Get window position XY on monitor
@@ -665,79 +812,47 @@ int GetKeyboardSurface(void)
 // Initialize platform: graphics, inputs and more
 int InitPlatform(void)
 {
-    // TODO: Initialize graphic device: display/window
-    // It usually requires setting up the platform display system configuration
-    // and connexion with the GPU through some system graphic API
-    // raylib uses OpenGL so, platform should create that kind of connection
-    // Below example illustrates that process using EGL library
+    platform.currentOutput = -1;
+    platform.device = EGL_NO_DISPLAY;
+    platform.surface = EGL_NO_SURFACE;
+    platform.context = EGL_NO_CONTEXT;
+
+    // Connect to the Wayland display and bind required globals
     //----------------------------------------------------------------------------
-    FLAG_SET(CORE.Window.flags, FLAG_FULLSCREEN_MODE);
-
-    if (FLAG_IS_SET(CORE.Window.flags, FLAG_MSAA_4X_HINT))
+    if (InitWaylandConnection() != 0)
     {
-        // TODO: Enable MSAA
-
-        TRACELOG(LOG_INFO, "DISPLAY: Trying to enable MSAA x4");
-    }
-
-    // TODO: Init display and graphic device
-
-    // TODO: Check display, device and context activation
-    bool result = true;
-    if (result)
-    {
-        CORE.Window.ready = true;
-
-        CORE.Window.render.width = CORE.Window.screen.width;
-        CORE.Window.render.height = CORE.Window.screen.height;
-        CORE.Window.currentFbo.width = CORE.Window.render.width;
-        CORE.Window.currentFbo.height = CORE.Window.render.height;
-    }
-    else
-    {
-        TRACELOG(LOG_FATAL, "PLATFORM: Failed to initialize graphics device");
+        TRACELOG(LOG_FATAL, "PLATFORM: Failed to connect to Wayland display");
+        CloseWaylandConnection();
         return -1;
     }
     //----------------------------------------------------------------------------
 
-    // If everything worked as expected, continue
-    CORE.Window.render.width = CORE.Window.screen.width;
-    CORE.Window.render.height = CORE.Window.screen.height;
-    CORE.Window.currentFbo.width = CORE.Window.render.width;
-    CORE.Window.currentFbo.height = CORE.Window.render.height;
-
-    TRACELOG(LOG_INFO, "DISPLAY: Device initialized successfully %s",
-        FLAG_IS_SET(CORE.Window.flags, FLAG_WINDOW_HIGHDPI)? "(HighDPI)" : "");
-    TRACELOG(LOG_INFO, "    > Display size: %i x %i", CORE.Window.display.width, CORE.Window.display.height);
-    TRACELOG(LOG_INFO, "    > Screen size:  %i x %i", CORE.Window.screen.width, CORE.Window.screen.height);
-    TRACELOG(LOG_INFO, "    > Render size:  %i x %i", CORE.Window.render.width, CORE.Window.render.height);
-    TRACELOG(LOG_INFO, "    > Viewport offsets: %i, %i", CORE.Window.renderOffset.x, CORE.Window.renderOffset.y);
-
-    // TODO: Load OpenGL extensions
-    // NOTE: GL procedures address loader is required to load extensions
-    //----------------------------------------------------------------------------
-    rlLoadExtensions(eglGetProcAddress);
-    //----------------------------------------------------------------------------
-
-    // TODO: Initialize input events system
-    // It could imply keyboard, mouse, gamepad, touch...
-    // Depending on the platform libraries/SDK it could use a callback mechanism
-    // For system events and inputs evens polling on a per-frame basis, use PollInputEvents()
+    // TODO: Create the layer surface from LayerConfig
     //----------------------------------------------------------------------------
     // ...
     //----------------------------------------------------------------------------
 
-    // TODO: Initialize timing system
+    // TODO: Initialize graphics device (EGL context on the layer surface)
+    //----------------------------------------------------------------------------
+    // ...
+    //----------------------------------------------------------------------------
+
+    // TODO: Initialize input events system (wl_seat: pointer, keyboard)
+    //----------------------------------------------------------------------------
+    // ...
+    //----------------------------------------------------------------------------
+
+    // Initialize timing system
     //----------------------------------------------------------------------------
     InitTimer();
     //----------------------------------------------------------------------------
 
-    // TODO: Initialize storage system
+    // Initialize storage system
     //----------------------------------------------------------------------------
     CORE.Storage.basePath = GetWorkingDirectory();
     //----------------------------------------------------------------------------
 
-    TRACELOG(LOG_INFO, "PLATFORM: CUSTOM: Initialized successfully");
+    TRACELOG(LOG_INFO, "PLATFORM: WAYLAND LAYER-SHELL: Initialized successfully");
 
     return 0;
 }
@@ -745,7 +860,277 @@ int InitPlatform(void)
 // Close platform
 void ClosePlatform(void)
 {
-    // TODO: De-initialize graphics, inputs and more
+    // TODO: Destroy EGL context and surface
+
+    // TODO: Destroy layer surface and input objects
+
+    CloseWaylandConnection();
+}
+
+// Connect to the Wayland display and bind required globals
+// NOTE: Two roundtrips are required: the first one receives the registry globals,
+// the second one receives the initial events of the bound objects (outputs geometry/mode/name)
+static int InitWaylandConnection(void)
+{
+    platform.display = wl_display_connect(NULL);
+    if (platform.display == NULL)
+    {
+        TRACELOG(LOG_WARNING, "WAYLAND: Failed to connect to display (is WAYLAND_DISPLAY set?)");
+        return -1;
+    }
+
+    platform.registry = wl_display_get_registry(platform.display);
+    if (platform.registry == NULL)
+    {
+        TRACELOG(LOG_WARNING, "WAYLAND: Failed to get registry");
+        return -1;
+    }
+
+    wl_registry_add_listener(platform.registry, &registryListener, NULL);
+
+    if (wl_display_roundtrip(platform.display) < 0)
+    {
+        TRACELOG(LOG_WARNING, "WAYLAND: Failed to receive registry globals");
+        return -1;
+    }
+
+    if (platform.compositor == NULL)
+    {
+        TRACELOG(LOG_WARNING, "WAYLAND: Compositor does not provide wl_compositor v%i", WL_COMPOSITOR_BIND_VERSION);
+        return -1;
+    }
+
+    if (platform.layerShell == NULL)
+    {
+        TRACELOG(LOG_WARNING, "WAYLAND: Compositor does not provide zwlr_layer_shell_v1 (wlr-layer-shell is required, e.g. Hyprland, sway, river)");
+        return -1;
+    }
+
+    if (platform.seat == NULL) TRACELOG(LOG_WARNING, "WAYLAND: Compositor does not provide wl_seat, no input available");
+    if (platform.wmBase == NULL) TRACELOG(LOG_INFO, "WAYLAND: xdg_wm_base not available, layer-shell popups disabled");
+    if ((platform.fractionalScaleManager == NULL) || (platform.viewporter == NULL))
+    {
+        TRACELOG(LOG_INFO, "WAYLAND: Fractional scale not available, using integer output scale");
+    }
+
+    // Receive initial events of bound globals (output properties, seat capabilities)
+    if (wl_display_roundtrip(platform.display) < 0)
+    {
+        TRACELOG(LOG_WARNING, "WAYLAND: Failed to receive initial globals events");
+        return -1;
+    }
+
+    if (platform.outputCount == 0) TRACELOG(LOG_WARNING, "WAYLAND: No outputs advertised by the compositor");
+
+    for (int i = 0; i < platform.outputCount; i++)
+    {
+        TRACELOG(LOG_INFO, "WAYLAND: Output %i: %s (%s) %ix%i@%iHz at (%i,%i), scale %i, %ix%i mm", i,
+            (platform.outputs[i].name[0] != '\0')? platform.outputs[i].name : "unnamed", platform.outputs[i].description,
+            platform.outputs[i].width, platform.outputs[i].height, (platform.outputs[i].refreshRate + 500)/1000,
+            platform.outputs[i].x, platform.outputs[i].y, platform.outputs[i].scale,
+            platform.outputs[i].physicalWidth, platform.outputs[i].physicalHeight);
+    }
+
+    // Display size defaults to the first output current mode
+    if (platform.outputCount > 0)
+    {
+        CORE.Window.display.width = platform.outputs[0].width;
+        CORE.Window.display.height = platform.outputs[0].height;
+    }
+
+    TRACELOG(LOG_INFO, "WAYLAND: Connected to display, %i output(s) available", platform.outputCount);
+
+    return 0;
+}
+
+// Release globals and disconnect from the Wayland display
+// NOTE: Objects are destroyed in reverse order of creation
+static void CloseWaylandConnection(void)
+{
+    for (int i = 0; i < platform.outputCount; i++)
+    {
+        if (platform.outputs[i].output != NULL) wl_output_destroy(platform.outputs[i].output);
+        platform.outputs[i].output = NULL;
+    }
+    platform.outputCount = 0;
+
+    if (platform.viewporter != NULL) wp_viewporter_destroy(platform.viewporter);
+    if (platform.fractionalScaleManager != NULL) wp_fractional_scale_manager_v1_destroy(platform.fractionalScaleManager);
+    if (platform.wmBase != NULL) xdg_wm_base_destroy(platform.wmBase);
+    if (platform.seat != NULL) wl_seat_destroy(platform.seat);
+    if (platform.layerShell != NULL) zwlr_layer_shell_v1_destroy(platform.layerShell);
+    if (platform.compositor != NULL) wl_compositor_destroy(platform.compositor);
+    if (platform.registry != NULL) wl_registry_destroy(platform.registry);
+
+    platform.viewporter = NULL;
+    platform.fractionalScaleManager = NULL;
+    platform.wmBase = NULL;
+    platform.seat = NULL;
+    platform.layerShell = NULL;
+    platform.compositor = NULL;
+    platform.registry = NULL;
+
+    if (platform.display != NULL)
+    {
+        wl_display_flush(platform.display);
+        wl_display_disconnect(platform.display);
+        platform.display = NULL;
+    }
+}
+
+// Registry: new global advertised
+static void RegistryGlobalCallback(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version)
+{
+    if (strcmp(interface, wl_compositor_interface.name) == 0)
+    {
+        // wl_surface v6 provides preferred_buffer_scale, bind the highest supported version
+        uint32_t bindVersion = (version < 6)? version : 6;
+        if (bindVersion >= WL_COMPOSITOR_BIND_VERSION) platform.compositor = wl_registry_bind(registry, name, &wl_compositor_interface, bindVersion);
+        else TRACELOG(LOG_WARNING, "WAYLAND: wl_compositor v%u too old, v%i required", version, WL_COMPOSITOR_BIND_VERSION);
+    }
+    else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0)
+    {
+        uint32_t bindVersion = (version < WL_LAYER_SHELL_BIND_VERSION)? version : WL_LAYER_SHELL_BIND_VERSION;
+        platform.layerShell = wl_registry_bind(registry, name, &zwlr_layer_shell_v1_interface, bindVersion);
+    }
+    else if (strcmp(interface, wl_seat_interface.name) == 0)
+    {
+        // Only the first seat is used
+        if (platform.seat == NULL)
+        {
+            uint32_t bindVersion = (version < WL_SEAT_BIND_VERSION)? version : WL_SEAT_BIND_VERSION;
+            platform.seat = wl_registry_bind(registry, name, &wl_seat_interface, bindVersion);
+        }
+    }
+    else if (strcmp(interface, wl_output_interface.name) == 0)
+    {
+        if (platform.outputCount >= MAX_WAYLAND_OUTPUTS)
+        {
+            TRACELOG(LOG_WARNING, "WAYLAND: Too many outputs, ignoring output global %u (max: %i)", name, MAX_WAYLAND_OUTPUTS);
+            return;
+        }
+
+        uint32_t bindVersion = (version < WL_OUTPUT_BIND_VERSION)? version : WL_OUTPUT_BIND_VERSION;
+        WaylandOutput *out = &platform.outputs[platform.outputCount];
+        memset(out, 0, sizeof(WaylandOutput));
+        out->globalName = name;
+        out->scale = 1;
+        out->output = wl_registry_bind(registry, name, &wl_output_interface, bindVersion);
+        wl_output_add_listener(out->output, &outputListener, out);
+        platform.outputCount++;
+    }
+    else if (strcmp(interface, xdg_wm_base_interface.name) == 0)
+    {
+        platform.wmBase = wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
+        xdg_wm_base_add_listener(platform.wmBase, &wmBaseListener, NULL);
+    }
+    else if (strcmp(interface, wp_fractional_scale_manager_v1_interface.name) == 0)
+    {
+        platform.fractionalScaleManager = wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1);
+    }
+    else if (strcmp(interface, wp_viewporter_interface.name) == 0)
+    {
+        platform.viewporter = wl_registry_bind(registry, name, &wp_viewporter_interface, 1);
+    }
+}
+
+// Registry: global removed (typically an output being unplugged)
+static void RegistryGlobalRemoveCallback(void *data, struct wl_registry *registry, uint32_t name)
+{
+    for (int i = 0; i < platform.outputCount; i++)
+    {
+        if (platform.outputs[i].globalName == name)
+        {
+            TRACELOG(LOG_INFO, "WAYLAND: Output removed: %s", (platform.outputs[i].name[0] != '\0')? platform.outputs[i].name : "unnamed");
+
+            wl_output_destroy(platform.outputs[i].output);
+
+            // Keep the array compact, preserving order of remaining outputs
+            for (int j = i; j < (platform.outputCount - 1); j++) platform.outputs[j] = platform.outputs[j + 1];
+            platform.outputCount--;
+            memset(&platform.outputs[platform.outputCount], 0, sizeof(WaylandOutput));
+
+            if (platform.currentOutput == i) platform.currentOutput = -1;
+            else if (platform.currentOutput > i) platform.currentOutput--;
+
+            return;
+        }
+    }
+}
+
+// Output: geometry (position, physical size, make/model)
+static void OutputGeometryCallback(void *data, struct wl_output *output, int32_t x, int32_t y, int32_t physicalWidth, int32_t physicalHeight, int32_t subpixel, const char *make, const char *model, int32_t transform)
+{
+    WaylandOutput *out = (WaylandOutput *)data;
+
+    out->x = x;
+    out->y = y;
+    out->physicalWidth = physicalWidth;
+    out->physicalHeight = physicalHeight;
+
+    // Description event (v4) overrides this when available
+    if (out->description[0] == '\0')
+    {
+        snprintf(out->description, sizeof(out->description), "%s %s", (make != NULL)? make : "", (model != NULL)? model : "");
+    }
+}
+
+// Output: mode (only the current mode is tracked)
+static void OutputModeCallback(void *data, struct wl_output *output, uint32_t flags, int32_t width, int32_t height, int32_t refresh)
+{
+    WaylandOutput *out = (WaylandOutput *)data;
+
+    if (flags & WL_OUTPUT_MODE_CURRENT)
+    {
+        out->width = width;
+        out->height = height;
+        out->refreshRate = refresh;
+    }
+}
+
+// Output: all pending properties sent
+static void OutputDoneCallback(void *data, struct wl_output *output)
+{
+    WaylandOutput *out = (WaylandOutput *)data;
+
+    out->done = true;
+
+    // Keep display size in sync with the first output
+    if ((platform.outputCount > 0) && (out == &platform.outputs[0]))
+    {
+        CORE.Window.display.width = out->width;
+        CORE.Window.display.height = out->height;
+    }
+}
+
+// Output: integer scale factor
+static void OutputScaleCallback(void *data, struct wl_output *output, int32_t factor)
+{
+    WaylandOutput *out = (WaylandOutput *)data;
+
+    out->scale = (factor > 0)? factor : 1;
+}
+
+// Output: connector name (wl_output v4)
+static void OutputNameCallback(void *data, struct wl_output *output, const char *name)
+{
+    WaylandOutput *out = (WaylandOutput *)data;
+
+    if (name != NULL) strncpy(out->name, name, LAYER_OUTPUT_NAME_LENGTH - 1);
+}
+
+// Output: human readable description (wl_output v4)
+static void OutputDescriptionCallback(void *data, struct wl_output *output, const char *description)
+{
+    WaylandOutput *out = (WaylandOutput *)data;
+
+    if (description != NULL) strncpy(out->description, description, sizeof(out->description) - 1);
+}
+
+// xdg_wm_base: compositor liveness check, must be answered or the client gets killed
+static void WmBasePingCallback(void *data, struct xdg_wm_base *wmBase, uint32_t serial)
+{
+    xdg_wm_base_pong(wmBase, serial);
 }
 
 // EOF
