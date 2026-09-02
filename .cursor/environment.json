@@ -1,0 +1,9 @@
+{
+  "name": "raylib",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "user": "ubuntu",
+  "install": "cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=ON && cmake --build build -j\"$(nproc)\"",
+  "start": "pgrep -x Xvfb >/dev/null || { rm -f /tmp/.X99-lock; Xvfb :99 -screen 0 1280x720x24 -nolisten tcp >/tmp/xvfb.log 2>&1 & } ; for i in $(seq 1 30); do [ -e /tmp/.X99-lock ] && break; sleep 0.2; done"
+}
