@@ -14,11 +14,12 @@
 *       - Single layer surface only for now (multi-surface API is declared in rshell.h)
 *       - No fullscreen/maximize/minimize/window position (concepts don't apply to layer surfaces)
 *       - No window icons, no gamepad, no touch, no clipboard yet
+*       - No cursor image is set on pointer enter (compositor default behaviour applies)
 *
 *   POSSIBLE IMPROVEMENTS:
 *       - Multiple layer surfaces (one per output) with BeginSurface() switching
-*       - Keyboard input through xkbcommon
-*       - Cursor shape support (wp_cursor_shape_v1)
+*       - Cursor shape support (wp_cursor_shape_v1 or wl_cursor)
+*       - Touch input (wl_touch) and clipboard (wl_data_device)
 *
 *   ADDITIONAL NOTES:
 *       - TRACELOG() function is located in raylib [utils] module
@@ -32,6 +33,7 @@
 *   DEPENDENCIES:
 *       - wayland-client: Wayland display connection, registry and core protocol objects
 *       - wayland-egl: wl_egl_window bridge between wl_surface and EGL
+*       - xkbcommon: keyboard keymap handling (keysyms, text input, modifiers)
 *       - EGL: OpenGL ES context creation on the Wayland surface
 *       - wlr-layer-shell-unstable-v1, xdg-shell, viewporter, fractional-scale-v1 protocols
 *         (XML files vendored in src/external/wayland-layer/protocols, headers generated with wayland-scanner)
@@ -64,9 +66,12 @@
 #include <string.h>         // Required for: strncpy(), strcmp(), memset()
 #include <unistd.h>         // Required for: close()
 #include <poll.h>           // Required for: poll() on the Wayland display fd
+#include <errno.h>          // Required for: errno, EINTR, EAGAIN
+#include <sys/mman.h>       // Required for: mmap()/munmap() of the keymap fd
 
 #include <wayland-client.h> // Wayland client library: display, registry, core protocol objects
 #include <wayland-egl.h>    // Wayland EGL bridge: wl_egl_window
+#include <xkbcommon/xkbcommon.h> // Keymap handling: keycodes to keysyms/utf32, modifiers state
 
 #include <EGL/egl.h>        // Native platform windowing system interface
 #include <EGL/eglext.h>     // EGL extensions
@@ -103,6 +108,20 @@
 #define WL_SEAT_BIND_VERSION        5       // wl_seat v5: wl_pointer.frame and axis_source events
 #define WL_OUTPUT_BIND_VERSION      4       // wl_output v4: name/description events (v2 minimum for scale/done)
 #define WL_LAYER_SHELL_BIND_VERSION 4       // zwlr_layer_shell_v1 v4: keyboard_interactivity on_demand, set_layer
+
+// Linux evdev button codes (linux/input-event-codes.h is not included to avoid KEY_* macros clashing with raylib KEY_* enum)
+#define EVDEV_BTN_LEFT      0x110
+#define EVDEV_BTN_RIGHT     0x111
+#define EVDEV_BTN_MIDDLE    0x112
+#define EVDEV_BTN_SIDE      0x113
+#define EVDEV_BTN_EXTRA     0x114
+#define EVDEV_BTN_FORWARD   0x115
+#define EVDEV_BTN_BACK      0x116
+
+#define EVDEV_KEYMAP_SIZE   128             // evdev keycodes mapped to raylib keys (standard keyboard block)
+#define XKB_EVDEV_OFFSET    8               // xkb keycodes = evdev keycodes + 8
+
+#define WHEEL_UNITS_PER_NOTCH   15.0        // Continuous axis units of one wheel notch (libinput convention)
 
 //----------------------------------------------------------------------------------
 // Types and Structures Definition
@@ -152,6 +171,22 @@ typedef struct {
     double scale;                           // Current buffer scale (fractional when available)
     int preferredBufferScale;               // Integer scale suggested by wl_surface.preferred_buffer_scale (0 = none)
 
+    // Input devices (from wl_seat capabilities)
+    struct wl_pointer *pointer;             // Pointer device (NULL if seat has no pointer)
+    struct wl_keyboard *keyboard;           // Keyboard device (NULL if seat has no keyboard)
+    bool axisDiscreteReceived[2];           // axis_discrete received in current pointer frame (index: 0 vertical, 1 horizontal)
+    bool keyboardFocus;                     // Surface currently holds keyboard focus
+
+    struct xkb_context *xkbContext;         // xkbcommon context
+    struct xkb_keymap *xkbKeymap;           // Keymap sent by the compositor
+    struct xkb_state *xkbState;             // Modifier/group state, updated from wl_keyboard.modifiers
+
+    int repeatRate;                         // Key repeat rate (chars per second), 0 disables repeat
+    int repeatDelay;                        // Key repeat delay (ms)
+    int repeatKey;                          // raylib key currently held for repeat (0 = none)
+    uint32_t repeatKeycode;                 // xkb keycode of the held key (for char repeat)
+    double repeatNextTime;                  // Time of the next repeat event (seconds, GetTime() base)
+
     // EGL graphics device
     EGLDisplay device;      // Native display device (physical screen connection)
     EGLSurface surface;     // Surface to draw on, framebuffers (connected to context)
@@ -165,6 +200,28 @@ typedef struct {
 extern CoreData CORE;                   // Global CORE state context
 
 static PlatformData platform = { 0 };   // Platform specific data
+
+// Map evdev keycodes (0..127, standard keyboard block) to raylib keys
+// NOTE: Physical (layout independent) mapping, like GLFW: KEY_A is the key at the US-layout "A" position.
+// Text input is layout aware through xkbcommon (see KeyboardKeyCallback)
+static const short evdevToRaylibKey[EVDEV_KEYMAP_SIZE] = {
+    0,   256, 49,  50,  51,  52,  53,  54,      //   0: reserved, ESC, 1, 2, 3, 4, 5, 6
+    55,  56,  57,  48,  45,  61,  259, 258,     //   8: 7, 8, 9, 0, -, =, BACKSPACE, TAB
+    81,  87,  69,  82,  84,  89,  85,  73,      //  16: Q, W, E, R, T, Y, U, I
+    79,  80,  91,  93,  257, 341, 65,  83,      //  24: O, P, [, ], ENTER, LEFT_CONTROL, A, S
+    68,  70,  71,  72,  74,  75,  76,  59,      //  32: D, F, G, H, J, K, L, ;
+    39,  96,  340, 92,  90,  88,  67,  86,      //  40: ', `, LEFT_SHIFT, \, Z, X, C, V
+    66,  78,  77,  44,  46,  47,  344, 332,     //  48: B, N, M, ,, ., /, RIGHT_SHIFT, KP_MULTIPLY
+    342, 32,  280, 290, 291, 292, 293, 294,     //  56: LEFT_ALT, SPACE, CAPS_LOCK, F1, F2, F3, F4, F5
+    295, 296, 297, 298, 299, 282, 281, 327,     //  64: F6, F7, F8, F9, F10, NUM_LOCK, SCROLL_LOCK, KP_7
+    328, 329, 333, 324, 325, 326, 334, 321,     //  72: KP_8, KP_9, KP_SUBTRACT, KP_4, KP_5, KP_6, KP_ADD, KP_1
+    322, 323, 320, 330, 0,   0,   0,   300,     //  80: KP_2, KP_3, KP_0, KP_DECIMAL, -, ZENKAKU, 102ND, F11
+    301, 0,   0,   0,   0,   0,   0,   0,       //  88: F12, RO, KATAKANA, HIRAGANA, HENKAN, KATAKANAHIRAGANA, MUHENKAN, KPJPCOMMA
+    335, 345, 331, 283, 346, 0,   268, 265,     //  96: KP_ENTER, RIGHT_CONTROL, KP_DIVIDE, PRINT_SCREEN, RIGHT_ALT, LINEFEED, HOME, UP
+    266, 263, 262, 269, 264, 267, 260, 261,     // 104: PAGE_UP, LEFT, RIGHT, END, DOWN, PAGE_DOWN, INSERT, DELETE
+    0,   0,   0,   0,   0,   336, 0,   284,     // 112: MACRO, MUTE, VOLUMEDOWN, VOLUMEUP, POWER, KP_EQUAL, KPPLUSMINUS, PAUSE
+    0,   0,   0,   0,   0,   347, 349, 348      // 120: SCALE, KPCOMMA, HANGEUL, HANJA, YEN, LEFT_SUPER, RIGHT_SUPER, KB_MENU
+};
 
 // Layer surface configuration for the primary surface (id 0), set before InitWindow()
 static LayerConfig layerConfig = {
@@ -207,6 +264,34 @@ static void SurfacePreferredBufferTransformCallback(void *data, struct wl_surfac
 
 // Fractional scale listener callbacks
 static void FractionalScalePreferredScaleCallback(void *data, struct wp_fractional_scale_v1 *fractionalScale, uint32_t scale);
+
+// Seat listener callbacks
+static void SeatCapabilitiesCallback(void *data, struct wl_seat *seat, uint32_t capabilities);
+static void SeatNameCallback(void *data, struct wl_seat *seat, const char *name);
+
+// Pointer listener callbacks
+static void PointerEnterCallback(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy);
+static void PointerLeaveCallback(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface);
+static void PointerMotionCallback(void *data, struct wl_pointer *pointer, uint32_t time, wl_fixed_t sx, wl_fixed_t sy);
+static void PointerButtonCallback(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time, uint32_t button, uint32_t state);
+static void PointerAxisCallback(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis, wl_fixed_t value);
+static void PointerFrameCallback(void *data, struct wl_pointer *pointer);
+static void PointerAxisSourceCallback(void *data, struct wl_pointer *pointer, uint32_t axisSource);
+static void PointerAxisStopCallback(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis);
+static void PointerAxisDiscreteCallback(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t discrete);
+
+// Keyboard listener callbacks
+static void KeyboardKeymapCallback(void *data, struct wl_keyboard *keyboard, uint32_t format, int32_t fd, uint32_t size);
+static void KeyboardEnterCallback(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface, struct wl_array *keys);
+static void KeyboardLeaveCallback(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface);
+static void KeyboardKeyCallback(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time, uint32_t key, uint32_t state);
+static void KeyboardModifiersCallback(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t modsDepressed, uint32_t modsLatched, uint32_t modsLocked, uint32_t group);
+static void KeyboardRepeatInfoCallback(void *data, struct wl_keyboard *keyboard, int32_t rate, int32_t delay);
+
+static void InitInputDevices(void);         // Create the xkbcommon context and request seat devices
+static void CloseInputDevices(void);        // Release pointer/keyboard objects and xkbcommon state
+static void DispatchWaylandEvents(int timeoutMs);   // Read and dispatch pending Wayland events (non-blocking when timeoutMs = 0)
+static void ProcessKeyPress(int key, uint32_t keycode, bool repeat); // Register a raylib key press and its character (if any)
 
 // Wayland registry listener callbacks
 static void RegistryGlobalCallback(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version);
@@ -258,6 +343,34 @@ static const struct wl_surface_listener surfaceListener = {
 
 static const struct wp_fractional_scale_v1_listener fractionalScaleListener = {
     .preferred_scale = FractionalScalePreferredScaleCallback
+};
+
+static const struct wl_seat_listener seatListener = {
+    .capabilities = SeatCapabilitiesCallback,
+    .name = SeatNameCallback
+};
+
+// NOTE: Seat is bound at v5 max, so axis_value120 (v8) and axis_relative_direction (v9)
+// are never sent and can stay unset (designated initializers zero them)
+static const struct wl_pointer_listener pointerListener = {
+    .enter = PointerEnterCallback,
+    .leave = PointerLeaveCallback,
+    .motion = PointerMotionCallback,
+    .button = PointerButtonCallback,
+    .axis = PointerAxisCallback,
+    .frame = PointerFrameCallback,
+    .axis_source = PointerAxisSourceCallback,
+    .axis_stop = PointerAxisStopCallback,
+    .axis_discrete = PointerAxisDiscreteCallback
+};
+
+static const struct wl_keyboard_listener keyboardListener = {
+    .keymap = KeyboardKeymapCallback,
+    .enter = KeyboardEnterCallback,
+    .leave = KeyboardLeaveCallback,
+    .key = KeyboardKeyCallback,
+    .modifiers = KeyboardModifiersCallback,
+    .repeat_info = KeyboardRepeatInfoCallback
 };
 
 //----------------------------------------------------------------------------------
@@ -667,30 +780,58 @@ void PollInputEvents(void)
     CORE.Input.Keyboard.keyPressedQueueCount = 0;
     CORE.Input.Keyboard.charPressedQueueCount = 0;
 
-    // Reset key repeats
-    for (int i = 0; i < MAX_KEYBOARD_KEYS; i++) CORE.Input.Keyboard.keyRepeatInFrame[i] = 0;
-
     // Reset last gamepad button/axis registered state
     CORE.Input.Gamepad.lastButtonPressed = 0; // GAMEPAD_BUTTON_UNKNOWN
     //CORE.Input.Gamepad.axisCount = 0;
 
-    // Register previous touch states
-    for (int i = 0; i < MAX_TOUCH_POINTS; i++) CORE.Input.Touch.previousTouchState[i] = CORE.Input.Touch.currentTouchState[i];
-
-    // Reset touch positions
-    // TODO: It resets on target platform the mouse position and not filled again until a move-event,
-    // so, if mouse is not moved it returns a (0, 0) position... this behaviour should be reviewed!
-    //for (int i = 0; i < MAX_TOUCH_POINTS; i++) CORE.Input.Touch.position[i] = (Vector2){ 0, 0 };
-
-    // Register previous keys states
-    // NOTE: Android supports up to 260 keys
-    for (int i = 0; i < 260; i++)
+    // Register previous keys states and reset key repeats
+    for (int i = 0; i < MAX_KEYBOARD_KEYS; i++)
     {
         CORE.Input.Keyboard.previousKeyState[i] = CORE.Input.Keyboard.currentKeyState[i];
         CORE.Input.Keyboard.keyRepeatInFrame[i] = 0;
     }
 
-    // TODO: Poll input events for current platform
+    // Register previous mouse states
+    // NOTE: Wheel movement is accumulated by pointer axis events during dispatch
+    CORE.Input.Mouse.previousPosition = CORE.Input.Mouse.currentPosition;
+    CORE.Input.Mouse.previousWheelMove = CORE.Input.Mouse.currentWheelMove;
+    CORE.Input.Mouse.currentWheelMove = (Vector2){ 0.0f, 0.0f };
+
+    for (int i = 0; i < MAX_MOUSE_BUTTONS; i++) CORE.Input.Mouse.previousButtonState[i] = CORE.Input.Mouse.currentButtonState[i];
+
+    // Register previous touch states
+    for (int i = 0; i < MAX_TOUCH_POINTS; i++) CORE.Input.Touch.previousTouchState[i] = CORE.Input.Touch.currentTouchState[i];
+
+    // Map touch position to mouse position for convenience (no touch devices supported)
+    CORE.Input.Touch.position[0] = CORE.Input.Mouse.currentPosition;
+
+    // Compute dispatch timeout: block when event waiting is enabled, but wake up for key repeats
+    int timeoutMs = 0;
+    if (CORE.Window.eventWaiting)
+    {
+        timeoutMs = -1;
+        if ((platform.repeatKey != 0) && (platform.repeatRate > 0))
+        {
+            double remaining = platform.repeatNextTime - GetTime();
+            timeoutMs = (remaining > 0.0)? (int)(remaining*1000.0) : 0;
+        }
+    }
+
+    // Read and dispatch Wayland events: surface configure/close, outputs, pointer, keyboard
+    DispatchWaylandEvents(timeoutMs);
+
+    // Client-side key repeat: compositors don't repeat keys, wl_keyboard.repeat_info gives the user settings
+    if ((platform.repeatKey != 0) && (platform.repeatRate > 0) && platform.keyboardFocus)
+    {
+        double now = GetTime();
+        double interval = 1.0/(double)platform.repeatRate;
+
+        while (now >= platform.repeatNextTime)
+        {
+            ProcessKeyPress(platform.repeatKey, platform.repeatKeycode, true);
+            platform.repeatNextTime += interval;
+        }
+    }
 }
 
 //----------------------------------------------------------------------------------
@@ -936,8 +1077,7 @@ int GetPointerSurface(void)
 // Get id of surface currently holding keyboard focus
 int GetKeyboardSurface(void)
 {
-    TRACELOG(LOG_WARNING, "LAYER: GetKeyboardSurface() not implemented yet");
-    return -1;
+    return platform.keyboardFocus? 0 : -1;
 }
 
 //----------------------------------------------------------------------------------
@@ -997,9 +1137,10 @@ int InitPlatform(void)
     TRACELOG(LOG_INFO, "    > Viewport offsets: %i, %i", CORE.Window.renderOffset.x, CORE.Window.renderOffset.y);
     //----------------------------------------------------------------------------
 
-    // TODO: Initialize input events system (wl_seat: pointer, keyboard)
+    // Initialize input events system (wl_seat: pointer, keyboard)
+    // NOTE: Devices are created from the seat capabilities event, already received on connection
     //----------------------------------------------------------------------------
-    // ...
+    InitInputDevices();
     //----------------------------------------------------------------------------
 
     // Initialize timing system
@@ -1020,13 +1161,390 @@ int InitPlatform(void)
 // Close platform
 void ClosePlatform(void)
 {
-    // TODO: Destroy input objects
-
+    CloseInputDevices();
     CloseGraphicsDevice();
     CloseLayerSurface();
     CloseWaylandConnection();
 
     CORE.Window.ready = false;
+}
+
+// Create the xkbcommon context and request seat devices
+// NOTE: The seat capabilities event has already been received during InitWaylandConnection(),
+// but devices are only created here so the layer surface exists when input events arrive
+static void InitInputDevices(void)
+{
+    platform.xkbContext = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    if (platform.xkbContext == NULL) TRACELOG(LOG_WARNING, "INPUT: Failed to create xkbcommon context, keyboard text input disabled");
+
+    // Default repeat settings until wl_keyboard.repeat_info is received
+    platform.repeatRate = 25;
+    platform.repeatDelay = 600;
+
+    if (platform.seat != NULL)
+    {
+        wl_seat_add_listener(platform.seat, &seatListener, NULL);
+        wl_display_roundtrip(platform.display);     // Receive capabilities -> creates pointer/keyboard
+    }
+
+    TRACELOG(LOG_INFO, "INPUT: Seat devices: %s%s%s", (platform.pointer != NULL)? "pointer " : "", (platform.keyboard != NULL)? "keyboard" : "",
+        ((platform.pointer == NULL) && (platform.keyboard == NULL))? "none" : "");
+}
+
+// Release pointer/keyboard objects and xkbcommon state
+static void CloseInputDevices(void)
+{
+    if (platform.pointer != NULL)
+    {
+        wl_pointer_release(platform.pointer);
+        platform.pointer = NULL;
+    }
+
+    if (platform.keyboard != NULL)
+    {
+        wl_keyboard_release(platform.keyboard);
+        platform.keyboard = NULL;
+    }
+
+    if (platform.xkbState != NULL) xkb_state_unref(platform.xkbState);
+    if (platform.xkbKeymap != NULL) xkb_keymap_unref(platform.xkbKeymap);
+    if (platform.xkbContext != NULL) xkb_context_unref(platform.xkbContext);
+    platform.xkbState = NULL;
+    platform.xkbKeymap = NULL;
+    platform.xkbContext = NULL;
+
+    platform.keyboardFocus = false;
+    platform.repeatKey = 0;
+}
+
+// Read and dispatch pending Wayland events
+// NOTE: Standard libwayland-client multi-reader pattern: prepare_read -> flush -> poll -> read/cancel -> dispatch_pending.
+// timeoutMs: 0 = non-blocking, -1 = block until an event arrives, >0 = block up to that time
+static void DispatchWaylandEvents(int timeoutMs)
+{
+    if (platform.display == NULL) return;
+
+    // Dispatch anything already queued before trying to read from the socket
+    while (wl_display_prepare_read(platform.display) != 0)
+    {
+        if (wl_display_dispatch_pending(platform.display) < 0) break;
+    }
+
+    // Send pending requests, EAGAIN just means the socket buffer is full, events still get read
+    if ((wl_display_flush(platform.display) < 0) && (errno != EAGAIN))
+    {
+        wl_display_cancel_read(platform.display);
+        TRACELOG(LOG_WARNING, "WAYLAND: Display connection lost (flush failed: %s)", strerror(errno));
+        CORE.Window.shouldClose = true;
+        return;
+    }
+
+    struct pollfd fd = { 0 };
+    fd.fd = wl_display_get_fd(platform.display);
+    fd.events = POLLIN;
+
+    int ready = 0;
+    do { ready = poll(&fd, 1, timeoutMs); } while ((ready < 0) && (errno == EINTR));
+
+    if (ready > 0) wl_display_read_events(platform.display);
+    else wl_display_cancel_read(platform.display);
+
+    if (wl_display_dispatch_pending(platform.display) < 0)
+    {
+        TRACELOG(LOG_WARNING, "WAYLAND: Display connection lost (error %i)", wl_display_get_error(platform.display));
+        CORE.Window.shouldClose = true;
+    }
+}
+
+// Register a raylib key press and its character (if any)
+static void ProcessKeyPress(int key, uint32_t keycode, bool repeat)
+{
+    if ((key > 0) && (key < MAX_KEYBOARD_KEYS))
+    {
+        CORE.Input.Keyboard.currentKeyState[key] = 1;
+        if (repeat) CORE.Input.Keyboard.keyRepeatInFrame[key] = 1;
+
+        if (CORE.Input.Keyboard.keyPressedQueueCount < MAX_KEY_PRESSED_QUEUE)
+        {
+            CORE.Input.Keyboard.keyPressedQueue[CORE.Input.Keyboard.keyPressedQueueCount] = key;
+            CORE.Input.Keyboard.keyPressedQueueCount++;
+        }
+
+        // Check exit key, like other desktop backends
+        if ((key == CORE.Input.Keyboard.exitKey) && !repeat) CORE.Window.shouldClose = true;
+    }
+
+    // Layout-aware text input through xkbcommon
+    if (platform.xkbState != NULL)
+    {
+        uint32_t codepoint = xkb_state_key_get_utf32(platform.xkbState, keycode);
+
+        if ((codepoint >= 32) && (codepoint != 127) && (CORE.Input.Keyboard.charPressedQueueCount < MAX_CHAR_PRESSED_QUEUE))
+        {
+            CORE.Input.Keyboard.charPressedQueue[CORE.Input.Keyboard.charPressedQueueCount] = (int)codepoint;
+            CORE.Input.Keyboard.charPressedQueueCount++;
+        }
+    }
+}
+
+// Seat: available input devices changed
+static void SeatCapabilitiesCallback(void *data, struct wl_seat *seat, uint32_t capabilities)
+{
+    bool hasPointer = (capabilities & WL_SEAT_CAPABILITY_POINTER);
+    bool hasKeyboard = (capabilities & WL_SEAT_CAPABILITY_KEYBOARD);
+
+    if (hasPointer && (platform.pointer == NULL))
+    {
+        platform.pointer = wl_seat_get_pointer(seat);
+        wl_pointer_add_listener(platform.pointer, &pointerListener, NULL);
+    }
+    else if (!hasPointer && (platform.pointer != NULL))
+    {
+        wl_pointer_release(platform.pointer);
+        platform.pointer = NULL;
+        CORE.Input.Mouse.cursorOnScreen = false;
+    }
+
+    if (hasKeyboard && (platform.keyboard == NULL))
+    {
+        platform.keyboard = wl_seat_get_keyboard(seat);
+        wl_keyboard_add_listener(platform.keyboard, &keyboardListener, NULL);
+    }
+    else if (!hasKeyboard && (platform.keyboard != NULL))
+    {
+        wl_keyboard_release(platform.keyboard);
+        platform.keyboard = NULL;
+        platform.keyboardFocus = false;
+        platform.repeatKey = 0;
+    }
+}
+
+// Seat: seat name (v2), informational only
+static void SeatNameCallback(void *data, struct wl_seat *seat, const char *name)
+{
+    TRACELOG(LOG_INFO, "INPUT: Using seat: %s", (name != NULL)? name : "unnamed");
+}
+
+// Pointer: entered the surface
+// NOTE: Coordinates are surface-local logical pixels, matching CORE.Window.screen space
+static void PointerEnterCallback(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy)
+{
+    if (surface != platform.wlSurface) return;
+
+    CORE.Input.Mouse.cursorOnScreen = true;
+    CORE.Input.Mouse.currentPosition = (Vector2){ (float)wl_fixed_to_double(sx), (float)wl_fixed_to_double(sy) };
+
+    // TODO: Set a cursor image (wl_cursor/wl_shm or wp_cursor_shape_v1), otherwise compositors may hide the cursor over the surface
+}
+
+// Pointer: left the surface
+static void PointerLeaveCallback(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface)
+{
+    if (surface != platform.wlSurface) return;
+
+    CORE.Input.Mouse.cursorOnScreen = false;
+}
+
+// Pointer: moved over the surface
+static void PointerMotionCallback(void *data, struct wl_pointer *pointer, uint32_t time, wl_fixed_t sx, wl_fixed_t sy)
+{
+    CORE.Input.Mouse.currentPosition = (Vector2){ (float)wl_fixed_to_double(sx), (float)wl_fixed_to_double(sy) };
+}
+
+// Pointer: button pressed/released
+static void PointerButtonCallback(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time, uint32_t button, uint32_t state)
+{
+    int rlButton = -1;
+
+    switch (button)
+    {
+        case EVDEV_BTN_LEFT: rlButton = MOUSE_BUTTON_LEFT; break;
+        case EVDEV_BTN_RIGHT: rlButton = MOUSE_BUTTON_RIGHT; break;
+        case EVDEV_BTN_MIDDLE: rlButton = MOUSE_BUTTON_MIDDLE; break;
+        case EVDEV_BTN_SIDE: rlButton = MOUSE_BUTTON_SIDE; break;
+        case EVDEV_BTN_EXTRA: rlButton = MOUSE_BUTTON_EXTRA; break;
+        case EVDEV_BTN_FORWARD: rlButton = MOUSE_BUTTON_FORWARD; break;
+        case EVDEV_BTN_BACK: rlButton = MOUSE_BUTTON_BACK; break;
+        default: break;
+    }
+
+    if ((rlButton < 0) || (rlButton >= MAX_MOUSE_BUTTONS)) return;
+
+    char pressed = (state == WL_POINTER_BUTTON_STATE_PRESSED)? 1 : 0;
+    CORE.Input.Mouse.currentButtonState[rlButton] = pressed;
+    CORE.Input.Touch.currentTouchState[rlButton] = pressed;
+
+#if SUPPORT_GESTURES_SYSTEM
+    GestureEvent gestureEvent = { 0 };
+    gestureEvent.touchAction = pressed? TOUCH_ACTION_DOWN : TOUCH_ACTION_UP;
+    gestureEvent.pointCount = 1;
+    gestureEvent.pointId[0] = 0;
+    gestureEvent.position[0] = CORE.Input.Mouse.currentPosition;
+    ProcessGestureEvent(gestureEvent);
+#endif
+}
+
+// Pointer: continuous scroll, value in surface-local units (about 15 per wheel notch)
+// NOTE: raylib convention: positive y = scroll up/away, Wayland positive = scroll down, so the sign is flipped.
+// When a discrete step was received in this frame the continuous value is ignored (already counted)
+static void PointerAxisCallback(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis, wl_fixed_t value)
+{
+    float amount = (float)(-wl_fixed_to_double(value)/WHEEL_UNITS_PER_NOTCH);
+
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+    {
+        if (!platform.axisDiscreteReceived[0]) CORE.Input.Mouse.currentWheelMove.y += amount;
+    }
+    else if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
+    {
+        if (!platform.axisDiscreteReceived[1]) CORE.Input.Mouse.currentWheelMove.x += amount;
+    }
+}
+
+// Pointer: end of a group of logically related events (v5)
+static void PointerFrameCallback(void *data, struct wl_pointer *pointer)
+{
+    platform.axisDiscreteReceived[0] = false;
+    platform.axisDiscreteReceived[1] = false;
+}
+
+// Pointer: scroll source (wheel, finger, continuous), not used
+static void PointerAxisSourceCallback(void *data, struct wl_pointer *pointer, uint32_t axisSource)
+{
+}
+
+// Pointer: scroll stopped (kinetic scrolling hint), not used
+static void PointerAxisStopCallback(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis)
+{
+}
+
+// Pointer: discrete scroll steps (wheel notches), preferred over the continuous value
+static void PointerAxisDiscreteCallback(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t discrete)
+{
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+    {
+        CORE.Input.Mouse.currentWheelMove.y += (float)(-discrete);
+        platform.axisDiscreteReceived[0] = true;
+    }
+    else if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
+    {
+        CORE.Input.Mouse.currentWheelMove.x += (float)(-discrete);
+        platform.axisDiscreteReceived[1] = true;
+    }
+}
+
+// Keyboard: compositor sent the keymap (fd + size, XKB v1 text format)
+static void KeyboardKeymapCallback(void *data, struct wl_keyboard *keyboard, uint32_t format, int32_t fd, uint32_t size)
+{
+    if ((format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) || (platform.xkbContext == NULL))
+    {
+        close(fd);
+        return;
+    }
+
+    char *mapString = (char *)mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (mapString == MAP_FAILED)
+    {
+        TRACELOG(LOG_WARNING, "INPUT: Failed to map keyboard keymap");
+        close(fd);
+        return;
+    }
+
+    struct xkb_keymap *keymap = xkb_keymap_new_from_string(platform.xkbContext, mapString, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    munmap(mapString, size);
+    close(fd);
+
+    if (keymap == NULL)
+    {
+        TRACELOG(LOG_WARNING, "INPUT: Failed to compile keyboard keymap");
+        return;
+    }
+
+    struct xkb_state *state = xkb_state_new(keymap);
+    if (state == NULL)
+    {
+        TRACELOG(LOG_WARNING, "INPUT: Failed to create keyboard state");
+        xkb_keymap_unref(keymap);
+        return;
+    }
+
+    if (platform.xkbState != NULL) xkb_state_unref(platform.xkbState);
+    if (platform.xkbKeymap != NULL) xkb_keymap_unref(platform.xkbKeymap);
+    platform.xkbKeymap = keymap;
+    platform.xkbState = state;
+
+    TRACELOG(LOG_INFO, "INPUT: Keyboard keymap loaded (%u bytes)", size);
+}
+
+// Keyboard: surface gained keyboard focus
+// NOTE: keys holds the currently pressed keys, registered so IsKeyDown() is correct right away
+static void KeyboardEnterCallback(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface, struct wl_array *keys)
+{
+    if (surface != platform.wlSurface) return;
+
+    platform.keyboardFocus = true;
+
+    uint32_t *keycode = NULL;
+    wl_array_for_each(keycode, keys)
+    {
+        if (*keycode < EVDEV_KEYMAP_SIZE)
+        {
+            int key = evdevToRaylibKey[*keycode];
+            if ((key > 0) && (key < MAX_KEYBOARD_KEYS)) CORE.Input.Keyboard.currentKeyState[key] = 1;
+        }
+    }
+}
+
+// Keyboard: surface lost keyboard focus, release every key to avoid stuck states
+static void KeyboardLeaveCallback(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface)
+{
+    if (surface != platform.wlSurface) return;
+
+    platform.keyboardFocus = false;
+    platform.repeatKey = 0;
+
+    for (int i = 0; i < MAX_KEYBOARD_KEYS; i++) CORE.Input.Keyboard.currentKeyState[i] = 0;
+}
+
+// Keyboard: key pressed/released (evdev keycode)
+static void KeyboardKeyCallback(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time, uint32_t key, uint32_t state)
+{
+    int rlKey = (key < EVDEV_KEYMAP_SIZE)? evdevToRaylibKey[key] : 0;
+    uint32_t xkbKeycode = key + XKB_EVDEV_OFFSET;
+
+    if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
+    {
+        ProcessKeyPress(rlKey, xkbKeycode, false);
+
+        // Arm key repeat for repeatable keys (modifiers and lock keys don't repeat)
+        if ((platform.repeatRate > 0) && (platform.xkbKeymap != NULL) && xkb_keymap_key_repeats(platform.xkbKeymap, xkbKeycode))
+        {
+            platform.repeatKey = (rlKey > 0)? rlKey : -1;   // -1: repeat only the character (unmapped key)
+            platform.repeatKeycode = xkbKeycode;
+            platform.repeatNextTime = GetTime() + (double)platform.repeatDelay/1000.0;
+        }
+    }
+    else
+    {
+        if ((rlKey > 0) && (rlKey < MAX_KEYBOARD_KEYS)) CORE.Input.Keyboard.currentKeyState[rlKey] = 0;
+
+        if (platform.repeatKeycode == xkbKeycode) platform.repeatKey = 0;
+    }
+}
+
+// Keyboard: modifiers state changed, keeps xkb state in sync for text input (shift, altgr, caps...)
+static void KeyboardModifiersCallback(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t modsDepressed, uint32_t modsLatched, uint32_t modsLocked, uint32_t group)
+{
+    if (platform.xkbState == NULL) return;
+
+    xkb_state_update_mask(platform.xkbState, modsDepressed, modsLatched, modsLocked, 0, 0, group);
+}
+
+// Keyboard: user repeat settings (v4), rate 0 disables repeat
+static void KeyboardRepeatInfoCallback(void *data, struct wl_keyboard *keyboard, int32_t rate, int32_t delay)
+{
+    platform.repeatRate = (rate > 0)? rate : 0;
+    platform.repeatDelay = (delay > 0)? delay : 0;
 }
 
 // Initialize EGL display, context and window surface on the layer surface

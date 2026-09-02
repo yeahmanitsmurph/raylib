@@ -749,8 +749,8 @@ ifeq ($(TARGET_PLATFORM),PLATFORM_DRM)
     endif
 endif
 ifeq ($(TARGET_PLATFORM),PLATFORM_WAYLAND_LAYER)
-    # NOTE: Required packages (Debian/Ubuntu): libwayland-dev libegl-dev libgles-dev
-    LDLIBS = -lwayland-client -lwayland-egl -lEGL -lpthread -lrt -lm -ldl
+    # NOTE: Required packages (Debian/Ubuntu): libwayland-dev libegl-dev libgles-dev libxkbcommon-dev
+    LDLIBS = -lwayland-client -lwayland-egl -lxkbcommon -lEGL -lpthread -lrt -lm -ldl
     ifeq ($(GRAPHICS),GRAPHICS_API_OPENGL_ES2)
         LDLIBS += -lGLESv2
     endif
